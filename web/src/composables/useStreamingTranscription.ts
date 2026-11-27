@@ -71,10 +71,15 @@ function isSupported(): boolean {
 }
 
 function buildUrl(language: string): string {
-  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
   const token = getToken()
   const params = new URLSearchParams({ language })
   if (token) params.set('token', token)
+  // 允许独立部署：VITE_WS_BASE 形如 wss://api.example.com（前后端不同域时使用）
+  const configured = String(import.meta.env.VITE_WS_BASE ?? '').trim().replace(/\/+$/, '')
+  if (configured) {
+    return `${configured}/ws/asr?${params.toString()}`
+  }
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
   return `${protocol}://${window.location.host}/ws/asr?${params.toString()}`
 }
 
