@@ -1,0 +1,39 @@
+:root {
+  // 品牌色
+  --ai-primary: #2f6bff;
+  --ai-primary-soft: #eef3ff;
+  --ai-success: #1f9d55;
+  --ai-warning: #d9822b;
+  --ai-danger: #d64545;
+
+  // 文本与背景
+  --ai-text: #1f2329;
+  --ai-text-secondary: #646a73;
+  --ai-text-placeholder: #8f959e;
+  --ai-border: #e5e6eb;
+  --ai-bg: #f5f7fa;
+  --ai-bg-card: #ffffff;
+
+  // 圆角 / 阴影 / 间距
+  --ai-radius-sm: 6px;
+  --ai-radius-md: 10px;
+  --ai-radius-lg: 14px;
+  --ai-shadow-card: 0 2px 8px rgba(31, 35, 41, 0.06);
+  --ai-shadow-float: 0 10px 30px rgba(31, 35, 41, 0.12);
+  --ai-space-1: 4px;
+  --ai-space-2: 8px;
+  --ai-space-3: 12px;
+  --ai-space-4: 16px;
+  --ai-space-6: 24px;
+
+  // Element Plus 主题变量
+  --el-color-primary: #2f6bff;
+  --el-color-primary-light-3: #6a93ff;
+  --el-color-primary-light-5: #97b5ff;
+  --el-color-primary-light-7: #c3d3ff;
+  --el-color-primary-light-8: #d9e3ff;
+  --el-color-primary-light-9: #eef3ff;
+  --el-color-primary-dark-2: #2555cc;
+  --el-border-radius-base: 8px;
+  --el-font-size-base: 14px;
+}

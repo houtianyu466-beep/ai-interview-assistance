@@ -1,0 +1,154 @@
+@use './variables.scss';
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+  font-size: 14px;
+  color: var(--ai-text);
+  background: var(--ai-bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--ai-primary);
+  text-decoration: none;
+}
+
+h1,
+h2,
+h3,
+h4,
+p {
+  margin: 0;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #d5d8dd;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---------- 通用布局 ---------- */
+.page {
+  padding: 4px;
+}
+
+.card {
+  background: var(--ai-bg-card);
+  border-radius: var(--ai-radius-md);
+  box-shadow: var(--ai-shadow-card);
+  padding: var(--ai-space-6);
+}
+
+.muted {
+  color: var(--ai-text-secondary);
+}
+
+.text-danger {
+  color: var(--ai-danger);
+}
+
+.text-success {
+  color: var(--ai-success);
+}
+
+.flex {
+  display: flex;
+}
+
+.flex-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.flex-center {
+  display: flex;
+  align-items: center;
+}
+
+.gap-2 {
+  gap: var(--ai-space-2);
+}
+
+.gap-3 {
+  gap: var(--ai-space-3);
+}
+
+.gap-4 {
+  gap: var(--ai-space-4);
+}
+
+.mt-2 {
+  margin-top: var(--ai-space-2);
+}
+
+.mt-3 {
+  margin-top: var(--ai-space-3);
+}
+
+.mt-4 {
+  margin-top: var(--ai-space-4);
+}
+
+.mt-6 {
+  margin-top: var(--ai-space-6);
+}
+
+.mb-2 {
+  margin-bottom: var(--ai-space-2);
+}
+
+.mb-3 {
+  margin-bottom: var(--ai-space-3);
+}
+
+.mb-4 {
+  margin-bottom: var(--ai-space-4);
+}
+
+.w-full {
+  width: 100%;
+}
+
+.pre-wrap {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.8;
+}
+
+/* ---------- 页面过渡 ---------- */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.18s ease;
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+/* ---------- 打印（报告页使用） ---------- */
+@media print {
+  .no-print {
+    display: none !important;
+  }
+}
