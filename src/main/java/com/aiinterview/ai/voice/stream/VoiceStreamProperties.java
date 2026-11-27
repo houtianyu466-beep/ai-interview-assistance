@@ -24,22 +24,28 @@ public class VoiceStreamProperties {
     private int sampleRate = 16000;
     /** 单帧时长（毫秒） */
     private int frameMs = 100;
-    /** VAD 静态能量阈值（0~1，归一化 RMS） */
-    private double energyThreshold = 0.012;
-    /** 噪声底自适应系数：阈值 = max(静态阈值, 噪声底 * factor) */
-    private double noiseFactor = 3.0;
+    /** VAD 绝对能量下限（0~1，归一化 RMS）：再安静的环境也不会低于它 */
+    private double energyThreshold = 0.006;
+    /** 噪声底自适应系数：起始阈值 = max(绝对下限, 噪声底 × 系数) */
+    private double noiseFactor = 2.2;
+    /** 判定「仍然在说话」的阈值比例（迟滞）：句中停顿用更低的阈值，避免一句话被切碎 */
+    private double endThresholdRatio = 0.55;
+    /** 判定语音开始前的平滑窗口帧数，抑制单帧毛刺 */
+    private int smoothFrames = 3;
     /** 认定语音开始的最短持续时长 */
-    private int minSpeechMs = 200;
+    private int minSpeechMs = 160;
     /** 认定语音结束的静音时长 */
     private int endSilenceMs = 600;
     /** 单段最长时长 */
     private int maxSegmentMs = 15000;
     /** 切段时向前保留的音频 */
-    private int preRollMs = 200;
+    private int preRollMs = 240;
     /** 转写并发线程数 */
-    private int workerThreads = 3;
+    private int workerThreads = 4;
     /** 等待转写队列长度，超出时丢弃最旧的待转写段 */
-    private int queueCapacity = 4;
+    private int queueCapacity = 8;
+    /** STOP 后等待在途转写的最长时间，超时也会回 STOPPED */
+    private int stopTimeoutMs = 20000;
 
     /** 返回是否启用流式端点。 */
     public boolean isEnabled() {
@@ -149,5 +155,34 @@ public class VoiceStreamProperties {
     /** 设置队列长度。 */
     public void setQueueCapacity(int queueCapacity) {
         this.queueCapacity = queueCapacity;
+    }
+    /** 返回判定「仍在说话」的阈值比例。 */
+    public double getEndThresholdRatio() {
+        return endThresholdRatio;
+    }
+
+    /** 设置判定「仍在说话」的阈值比例。 */
+    public void setEndThresholdRatio(double endThresholdRatio) {
+        this.endThresholdRatio = endThresholdRatio;
+    }
+
+    /** 返回平滑窗口帧数。 */
+    public int getSmoothFrames() {
+        return smoothFrames;
+    }
+
+    /** 设置平滑窗口帧数。 */
+    public void setSmoothFrames(int smoothFrames) {
+        this.smoothFrames = smoothFrames;
+    }
+
+    /** 返回 STOP 后等待在途转写的超时时间。 */
+    public int getStopTimeoutMs() {
+        return stopTimeoutMs;
+    }
+
+    /** 设置 STOP 后等待在途转写的超时时间。 */
+    public void setStopTimeoutMs(int stopTimeoutMs) {
+        this.stopTimeoutMs = stopTimeoutMs;
     }
 }

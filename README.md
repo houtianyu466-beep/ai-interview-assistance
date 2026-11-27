@@ -39,7 +39,8 @@
 - 练习复盘：总分、等级、四维能力、优势/待提升、逐题参考答案、下一步练习建议
 - 练习记录：继续未完成的练习、回看已完成复盘
 - **AI 教练**：练习中随时提问，真实调用 DeepSeek function calling，工具包括知识库检索、练习状态、我的简历，回答带引用来源与完整调用链
-- **视频面试**：微信视频通话风格，支持 AI 模拟面试（数字人 + TTS + 字幕 + 语音作答）与真人 1v1（WebRTC + 房间码）
+- **视频面试**：微信视频通话风格，支持 AI 模拟面试（数字人 + TTS + 实时字幕 + 语音作答）与真人 1v1（WebRTC + 房间码）
+- **实时字幕**：说话过程中右侧实时出字；AI 朗读支持接豆包/OpenAI 兼容 TTS，未配置时浏览器兜底
 
 **辅助**
 - 我的简历：上传 docx / pdf / txt / md 或粘贴文本，AI 解析后用于个性化出题（PDF 先转 docx 再复用同一套清洗逻辑）
@@ -226,7 +227,7 @@ curl -X POST .../practice/sessions/$SID/coach -H "Authorization: Bearer $TOKEN" 
 ## 6. 测试
 
 ```bash
-mvn test          # 55 个后端测试
+mvn test          # 67 个后端测试
 cd web
 npm run test:e2e  # 练习 + AI 教练 UI 冒烟（需本机 Chrome）
 node scripts/video-test.mjs   # 视频面试 E2E（假摄像头，覆盖 AI 与真人 WebRTC）
@@ -245,6 +246,9 @@ node scripts/video-test.mjs   # 视频面试 E2E（假摄像头，覆盖 AI 与�
 | `web/scripts/ui-smoke.mjs` | 登录 → 工作台 → 房间 → 提示 → AI 教练（引用/工具）→ 复盘 → 记录 → 指南 → 移动端 |
 | `web/scripts/video-test.mjs` | AI 视频面试 5 题、真人 1:1 offer/answer/ICE、双方远端视频流 |
 | `web/scripts/asr-stream-test.mjs` | WS 流式转写：READY / SPEECH_START / TRANSCRIPT 与文本 |
+| `web/scripts/vad-probe.mjs` | 4 档音量的 VAD 检出率与「尾句先于 STOPPED」顺序 |
+| `VadSegmenterTest`（回归） | 小声检出、句中停顿不切碎、说话期噪声底不上涨 |
+| `TtsClientTest` | OpenAI 兼容请求体、火山 base64 解码、未配置提示 |
 
 UI 截图输出到 `web/screenshots/`。
 
@@ -279,7 +283,8 @@ web/                   # 前端（Vue 3 + TS + Vite）
 
 | 文档 | 内容 |
 |---|---|
-| [RAG · Agent · 视频通话实现](docs/08-RAG-Agent-视频通话实现.md) | BM25/混合检索、工具调用、WebRTC 信令、流式 ASR（VAD）、PDF 简历、配置与验证 |
+| [RAG · Agent · 视频通话实现](docs/08-RAG-Agent-视频通话实现.md) | BM25/混合检索、工具调用、WebRTC 信令、流式 ASR（VAD）、PDF 简历、TTS、配置与验证 |
+| [缺陷报告 01：流式语音漏检与尾句丢失](docs/09-缺陷报告-01-流式语音漏检与尾句丢失.md) | 现象、实测数据、根因、修复与回归用例 |
 | [练习工具产品重构方案](docs/07-练习工具产品重构方案.md) | 定位、信息架构、练习闭环、语音方案、路线图 |
 | [源码阅读指南](docs/02-源码阅读指南-全流程.md) | 启动、请求链路、面试引擎、AI、WebSocket、断点调试 |
 | [数据库设计](docs/03-数据库设计.md) | 表结构（含 `practice_target` / 知识库 / 视频房间）、状态机 |

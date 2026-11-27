@@ -129,12 +129,12 @@ class VadSegmenterTest {
         VoiceStreamProperties properties = new VoiceStreamProperties();
         properties.setSampleRate(SAMPLE_RATE);
         properties.setFrameMs(FRAME_MS);
-        properties.setEnergyThreshold(0.012);
-        properties.setNoiseFactor(3.0);
-        properties.setMinSpeechMs(200);
+        properties.setEnergyThreshold(0.006);
+        properties.setNoiseFactor(2.2);
+        properties.setMinSpeechMs(160);
         properties.setEndSilenceMs(600);
         properties.setMaxSegmentMs(15000);
-        properties.setPreRollMs(200);
+        properties.setPreRollMs(240);
         return properties;
     }
 
@@ -162,5 +162,78 @@ class VadSegmenterTest {
             pcm[i * 2 + 1] = (byte) ((sample >> 8) & 0xFF);
         }
         return pcm;
+    }
+    /**
+     * 缺陷回归：麦克风偏小声（RMS 约 0.014）时也必须能触发语音检测。
+     *
+     * <p>修复前静态阈值 0.012 对「降噪后只剩一半音量」的输入经常漏检，
+     * 表现为用户说话但界面一直没有反应。</p>
+     */
+    @Test
+    @DisplayName("小声输入也能触发语音检测")
+    void shouldDetectQuietSpeech() {
+        VadSegmenter segmenter = segmenter();
+        List<VadSegmenter.Segment> segments = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            segments.addAll(segmenter.accept(frame(0)));
+        }
+        // 振幅 0.02 ≈ RMS 0.014，属于偏小声但正常说话的输入
+        for (int i = 0; i < 12; i++) {
+            segments.addAll(segmenter.accept(frame(0.02)));
+        }
+        assertThat(segmenter.isInSpeech()).isTrue();
+        for (int i = 0; i < 8; i++) {
+            segments.addAll(segmenter.accept(frame(0)));
+        }
+        assertThat(segments).hasSize(1);
+    }
+
+    /**
+     * 缺陷回归：句中短促停顿（200ms）不应把一句话切成两段。
+     *
+     * <p>修复前没有迟滞判定，正常换气或弱读音节就会被当成句尾，
+     * 导致转写结果被切碎（例如只识别出「端开发经验。」）。</p>
+     */
+    @Test
+    @DisplayName("句中短停顿不会切碎句子")
+    void shouldNotSplitOnShortPause() {
+        VadSegmenter segmenter = segmenter();
+        List<VadSegmenter.Segment> segments = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            segments.addAll(segmenter.accept(frame(0)));
+        }
+        for (int i = 0; i < 6; i++) {
+            segments.addAll(segmenter.accept(frame(0.3)));
+        }
+        // 200ms 低能量停顿，低于 endSilenceMs=600
+        for (int i = 0; i < 2; i++) {
+            segments.addAll(segmenter.accept(frame(0.002)));
+        }
+        for (int i = 0; i < 6; i++) {
+            segments.addAll(segmenter.accept(frame(0.3)));
+        }
+        assertThat(segments).isEmpty();
+        assertThat(segmenter.isInSpeech()).isTrue();
+        for (int i = 0; i < 8; i++) {
+            segments.addAll(segmenter.accept(frame(0)));
+        }
+        assertThat(segments).hasSize(1);
+    }
+
+    /**
+     * 缺陷回归：说话期间噪声底不能被抬高，否则阈值会随说话一起上涨导致后半句漏检。
+     */
+    @Test
+    @DisplayName("说话期间噪声底不上涨")
+    void shouldNotInflateNoiseFloorWhileSpeaking() {
+        VadSegmenter segmenter = segmenter();
+        for (int i = 0; i < 5; i++) {
+            segmenter.accept(frame(0));
+        }
+        double before = segmenter.noiseFloor();
+        for (int i = 0; i < 20; i++) {
+            segmenter.accept(frame(0.3));
+        }
+        assertThat(segmenter.noiseFloor()).isLessThan(before * 1.2 + 0.001);
     }
 }

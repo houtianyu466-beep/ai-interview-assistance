@@ -530,13 +530,90 @@ HTTP 层已实测：上传 `resume-sample.pdf` → `PARSED`，`rawText` 保留�
 
 ---
 
-## 7. 验证与截图
+## 7. 语音合成（TTS）
+
+AI 面试官朗读题目默认走浏览器 `speechSynthesis`，音色偏机械。现在支持接真实 TTS，
+优先级：**后端合成 → 浏览器兜底**。
+
+### 7.1 三种 provider
+
+| provider | 说明 | 需要的配置 |
+|---|---|---|
+| `none`（默认） | 不启用，前端用浏览器语音合成 | — |
+| `openai` | OpenAI 兼容 `POST /audio/speech`，可接 OpenAI `tts-1`、硅基流动 CosyVoice2、各类代理 | `APP_TTS_API_KEY` + `APP_TTS_BASE_URL` + `APP_TTS_MODEL` |
+| `volcengine` | 火山引擎（豆包）HTTP 合成，韵律最接近日常对话 | `APP_TTS_APP_ID` + `APP_TTS_ACCESS_TOKEN` + `APP_TTS_CLUSTER` |
+
+### 7.2 配置示例
+
+```yaml
+app:
+  tts:
+    provider: ${APP_TTS_PROVIDER:none}
+    base-url: ${APP_TTS_BASE_URL:https://api.openai.com/v1}
+    api-key: ${APP_TTS_API_KEY:}
+    model: ${APP_TTS_MODEL:tts-1}
+    voice: ${APP_TTS_VOICE:alloy}
+    response-format: mp3
+    speed: 1.0
+    # 豆包
+    app-id: ${APP_TTS_APP_ID:}
+    access-token: ${APP_TTS_ACCESS_TOKEN:}
+    cluster: ${APP_TTS_CLUSTER:volcano_tts}
+    volc-voice: ${APP_TTS_VOLC_VOICE:zh_female_shuangkuaisisi_moon_bigtts}
+```
+
+豆包示例：
+
+```powershell
+$env:APP_TTS_PROVIDER = "volcengine"
+$env:APP_TTS_APP_ID = "你的 appid"
+$env:APP_TTS_ACCESS_TOKEN = "你的 access token"
+$env:APP_TTS_VOLC_VOICE = "zh_female_shuangkuaisisi_moon_bigtts"
+```
+
+OpenAI 兼容示例（硅基流动 CosyVoice2）：
+
+```powershell
+$env:APP_TTS_PROVIDER = "openai"
+$env:APP_TTS_BASE_URL = "https://api.siliconflow.cn/v1"
+$env:APP_TTS_API_KEY = "sk-..."
+$env:APP_TTS_MODEL = "FunAudioLLM/CosyVoice2-0.5B"
+$env:APP_TTS_VOICE = "FunAudioLLM/CosyVoice2-0.5B:anna"
+```
+
+> 实测：本机 SiliconFlow Key 调 `/audio/speech` 返回 `400 参数无效`（该 Key 未开通/TTS 权限受限）。
+> 因此默认保持 `none`，由前端浏览器兜底；换成豆包或已开通 TTS 的 Key 后即时生效。
+
+### 7.3 接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/v1/voice/tts` | 请求 `{text, voice}`，返回 `audio/mpeg`，带 `X-TTS-Provider`、`X-TTS-Latency` 头 |
+| GET | `/api/v1/voice/tts/info` | `{enabled, provider, voice, model}`，前端据此决定是否先走后端 |
+
+未配置时 POST 返回错误、`info.enabled=false`，前端**不会**发合成请求，直接走浏览器。
+
+### 7.4 浏览器兜底也做了优化
+
+`useNarrator` 在兜底时会按中文标点切句，逐句微调语速（0.96~1.06）与音高（0.96~1.06），
+并保留句末停顿——比整段同一语速朗读更接近真人节奏，是「没有 TTS Key 时」的可用降级。
+
+### 7.5 播放与面试流程的配合
+
+- AI 出题后立即朗读，朗读期间界面显示「AI 正在说话」；
+- 用户点「语音作答」时自动 `cancel()`，避免把 AI 声音录进答案；
+- 静音开关与「重听」按钮复用同一套播放逻辑。
+
+---
+
+## 8. 验证与截图
 
 ```bash
 mvn test                                # 55 个后端测试
 cd web && npm run test:e2e              # 练习 + 教练 UI 冒烟（截图 01-10、17）
 cd web && node scripts/video-test.mjs   # 视频面试 E2E（截图 11-16）
 cd web && node scripts/asr-stream-test.mjs   # 流式转写 E2E（WS + VAD + ASR）
+cd web && node scripts/vad-probe.mjs          # VAD 多音量档位诊断（缺陷回归）
 ```
 
 `video-test.mjs` 使用 Chrome 假摄像头/麦克风：
@@ -557,7 +634,7 @@ cd web && node scripts/asr-stream-test.mjs   # 流式转写 E2E（WS + VAD + ASR
 
 ---
 
-## 8. 安全与隐私
+## 9. 安全与隐私
 
 - 知识库、教练、视频房间均要求登录；教练接口校验练习归属；
 - 语音文件落在 `data/uploads/voice/`，仅用于转写，当前无自动清理，生产需加保留策略；
@@ -567,7 +644,7 @@ cd web && node scripts/asr-stream-test.mjs   # 流式转写 E2E（WS + VAD + ASR
 
 ---
 
-## 9. 后续演进
+## 10. 后续演进
 
 | 方向 | 内容 |
 |---|---|

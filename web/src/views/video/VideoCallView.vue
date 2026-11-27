@@ -118,6 +118,21 @@
             本轮提问已结束，可以前往复盘
           </p>
         </div>
+
+        <!-- 你说话时的实时转写：一边说一边在右侧出字 -->
+        <aside
+          v-if="streamingMode && (recording || streamText)"
+          class="call__live-caption"
+          aria-live="polite"
+        >
+          <div class="call__live-head">
+            <span class="call__live-dot" :class="{ 'is-active': streamSpeechActive }" />
+            <span>实时转写</span>
+            <span v-if="streamLatency > 0" class="call__live-tag">{{ streamLatency }}ms</span>
+          </div>
+          <p class="call__live-body">{{ streamText || '正在聆听…' }}</p>
+          <p class="call__live-tip">说完一句立即出字，可继续说</p>
+        </aside>
       </div>
 
       <!-- 顶部信息条 -->
@@ -403,6 +418,7 @@ import { ApiError } from '@/api/http'
 import { useCallSocket } from '@/composables/useCallSocket'
 import { useVoiceRecorder } from '@/composables/useVoiceRecorder'
 import { useStreamingTranscription } from '@/composables/useStreamingTranscription'
+import { useNarrator } from '@/composables/useNarrator'
 import {
   createPeer,
   isGetUserMediaSupported,
@@ -507,6 +523,8 @@ const asrUnavailable = ref(false)
 const awaitingNext = ref(false)
 
 const ttsSupported = typeof window !== 'undefined' && 'speechSynthesis' in window
+// 朗读优先走后端语音合成（豆包/OpenAI 兼容），失败退回浏览器
+const narrator = useNarrator()
 const ttsEnabled = ref(true)
 const speaking = ref(false)
 
@@ -1212,41 +1230,20 @@ function stopTicker(): void {
 }
 
 function canSpeak(): boolean {
-  return ttsSupported && ttsEnabled.value
+  return ttsEnabled.value && (narrator.backendEnabled.value || ttsSupported)
 }
 
 function speak(text: string): void {
   if (!canSpeak() || !text) return
-  try {
-    window.speechSynthesis.cancel()
-    const utterance = new SpeechSynthesisUtterance(text)
-    utterance.lang = 'zh-CN'
-    utterance.rate = 1
-    utterance.pitch = 1
-    utterance.onstart = () => {
-      speaking.value = true
-    }
-    utterance.onend = () => {
-      speaking.value = false
-    }
-    utterance.onerror = () => {
-      speaking.value = false
-    }
-    window.speechSynthesis.speak(utterance)
-  } catch {
-    // 浏览器 TTS 不可用时静默降级，只显示字幕
+  speaking.value = true
+  void narrator.speak(text).catch(() => {
     speaking.value = false
-  }
+  })
 }
 
 function cancelSpeech(): void {
   speaking.value = false
-  if (!ttsSupported) return
-  try {
-    window.speechSynthesis.cancel()
-  } catch {
-    // 忽略
-  }
+  narrator.cancel()
 }
 
 function toggleTts(): void {
@@ -1741,6 +1738,7 @@ onMounted(() => {
   previousBodyOverflow = document.body.style.overflow
   document.body.style.overflow = 'hidden'
   window.addEventListener('beforeunload', handleBeforeUnload)
+  void narrator.refreshCapability()
   void boot()
 })
 
@@ -1983,6 +1981,67 @@ onUnmounted(() => {
 /* ---------- AI 舞台 ---------- */
 .call__stage--ai {
   align-items: center;
+}
+
+/* 右侧实时转写卡片：说话过程中持续更新 */
+.call__live-caption {
+  position: absolute;
+  z-index: 6;
+  right: 24px;
+  top: 120px;
+  width: min(320px, 34vw);
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(16, 20, 28, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(16px);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.32);
+}
+
+.call__live-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: rgba(255, 255, 255, 0.62);
+}
+
+.call__live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.35);
+  transition: background 0.2s ease;
+
+  &.is-active {
+    background: #f56c6c;
+    box-shadow: 0 0 0 4px rgba(245, 108, 108, 0.24);
+  }
+}
+
+.call__live-tag {
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.call__live-body {
+  margin: 8px 0 0;
+  font-size: 14px;
+  line-height: 1.75;
+  color: #f2f5fa;
+  word-break: break-word;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.call__live-tip {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.42);
 }
 
 .ai-stage {

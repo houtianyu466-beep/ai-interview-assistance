@@ -16,9 +16,11 @@ import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -32,16 +34,19 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <p>协议（服务端 → 客户端）：</p>
  * <ul>
- *     <li>{@code READY}：{@code {sampleRate, frameMs}}，连接建立后立即下发；</li>
- *     <li>{@code SPEECH_START}：检测到说话开始，前端可据此切换「正在说话」状态；</li>
- *     <li>{@code TRANSCRIPT}：{@code {text, seq, startMs, endMs, latencyMs, provider}}，
- *         每切出一句就推送一条，前端按顺序拼接即可实时显示；</li>
- *     <li>{@code ERROR}：{@code {message}}，转写失败但连接保留，可继续说话；</li>
- *     <li>{@code STOPPED}：收尾完成。</li>
+ *     <li>{@code READY}：{@code {sampleRate, frameMs, endSilenceMs, provider}}；</li>
+ *     <li>{@code SPEECH_START} / {@code SPEECH_END}：进入/离开语音段；</li>
+ *     <li>{@code TRANSCRIPT}：{@code {text, seq, startMs, endMs, latencyMs, provider, final}}；</li>
+ *     <li>{@code ERROR}：转写失败但连接保留；</li>
+ *     <li>{@code STOPPED}：<b>所有在途转写都已推送之后</b>才发送，客户端据此收尾。</li>
  * </ul>
  *
- * <p>并发模型：连接线程只做 VAD 与切段，转写交给共享线程池；线程池满时丢弃最旧的
- * 待转写段并回一条 {@code ERROR}，保证实时性优先于完整性。</p>
+ * <p>为什么 STOPPED 要等待：早期实现里 STOP 只把最后一段交给线程池就立刻回
+ * STOPPED，前端收到后马上关闭连接，最后一句的转写结果到达时连接已断开，
+ * 表现为「说完了却没出字」。现在用 pending 计数 + 超时兜底保证不丢尾句。</p>
+ *
+ * <p>并发模型：连接线程只做 VAD 与切段；转写交给有界线程池，队列满时丢弃最旧的
+ * 待转写任务并回 {@code ERROR}，保证实时性优先于完整性。</p>
  */
 @Component
 public class StreamingAsrWebSocketHandler extends TextWebSocketHandler {
@@ -54,13 +59,21 @@ public class StreamingAsrWebSocketHandler extends TextWebSocketHandler {
     public static final String ATTR_LANGUAGE = "language";
     /** 会话属性键：是否已开始说话。 */
     private static final String ATTR_SPEECH_STARTED = "speechStarted";
+    /** 会话属性键：在途转写任务数。 */
+    private static final String ATTR_PENDING = "pendingTranscripts";
+    /** 会话属性键：是否已停止接收音频。 */
+    private static final String ATTR_STOPPING = "stopping";
+    /** 会话属性键：STOPPED 是否已发送。 */
+    private static final String ATTR_STOPPED_SENT = "stoppedSent";
+
+    /** 会话属性键：该连接专用的单线程执行器，保证分段按序转写。 */
+    private static final String ATTR_EXECUTOR = "asrExecutor";
 
     private final AsrClient asrClient;
     private final VoiceStreamProperties properties;
-    private final ExecutorService executor;
 
     /**
-     * 构造器注入并按配置创建转写线程池。
+     * 构造器注入。
      *
      * @param asrClient  转写客户端
      * @param properties 流式配置
@@ -68,12 +81,6 @@ public class StreamingAsrWebSocketHandler extends TextWebSocketHandler {
     public StreamingAsrWebSocketHandler(AsrClient asrClient, VoiceStreamProperties properties) {
         this.asrClient = asrClient;
         this.properties = properties;
-        AtomicInteger counter = new AtomicInteger();
-        this.executor = Executors.newFixedThreadPool(Math.max(1, properties.getWorkerThreads()), runnable -> {
-            Thread thread = new Thread(runnable, "streaming-asr-" + counter.incrementAndGet());
-            thread.setDaemon(true);
-            return thread;
-        });
     }
 
     /**
@@ -84,9 +91,11 @@ public class StreamingAsrWebSocketHandler extends TextWebSocketHandler {
     @Override
     public void afterConnectionEstablished(WebSocketSession session) {
         session.getAttributes().put(ATTR_SEGMENTER, new VadSegmenter(properties));
-        if (!session.getAttributes().containsKey(ATTR_LANGUAGE)) {
-            session.getAttributes().put(ATTR_LANGUAGE, "zh");
-        }
+        session.getAttributes().putIfAbsent(ATTR_LANGUAGE, "zh");
+        session.getAttributes().put(ATTR_PENDING, new AtomicInteger());
+        session.getAttributes().put(ATTR_EXECUTOR, newExecutor(session.getId()));
+        session.getAttributes().put(ATTR_STOPPING, new AtomicBoolean(false));
+        session.getAttributes().put(ATTR_STOPPED_SENT, new AtomicBoolean(false));
         Map<String, Object> ready = new LinkedHashMap<>();
         ready.put("type", "READY");
         ready.put("sampleRate", properties.getSampleRate());
@@ -107,7 +116,7 @@ public class StreamingAsrWebSocketHandler extends TextWebSocketHandler {
     @Override
     protected void handleBinaryMessage(WebSocketSession session, BinaryMessage message) {
         VadSegmenter segmenter = (VadSegmenter) session.getAttributes().get(ATTR_SEGMENTER);
-        if (segmenter == null) {
+        if (segmenter == null || isStopping(session)) {
             return;
         }
         byte[] frame = new byte[message.getPayloadLength()];
@@ -124,12 +133,12 @@ public class StreamingAsrWebSocketHandler extends TextWebSocketHandler {
             submit(session, segment);
         }
         boolean speechStarted = Boolean.TRUE.equals(session.getAttributes().get(ATTR_SPEECH_STARTED));
-        // 通过「VAD 是否处于语音段」通知前端说话状态，用于 UI 上的呼吸动画
         if (!speechStarted && segmenter.isInSpeech()) {
             session.getAttributes().put(ATTR_SPEECH_STARTED, Boolean.TRUE);
             send(session, Map.of("type", "SPEECH_START"));
         } else if (speechStarted && !segmenter.isInSpeech()) {
             session.getAttributes().put(ATTR_SPEECH_STARTED, Boolean.FALSE);
+            send(session, Map.of("type", "SPEECH_END"));
         }
     }
 
@@ -153,15 +162,7 @@ public class StreamingAsrWebSocketHandler extends TextWebSocketHandler {
             return;
         }
         switch (type) {
-            case "STOP" -> {
-                VadSegmenter segmenter = (VadSegmenter) session.getAttributes().get(ATTR_SEGMENTER);
-                if (segmenter != null) {
-                    for (VadSegmenter.Segment segment : segmenter.flush()) {
-                        submit(session, segment);
-                    }
-                }
-                send(session, Map.of("type", "STOPPED"));
-            }
+            case "STOP" -> stop(session);
             case "PING" -> send(session, Map.of("type", "PONG"));
             case "LANGUAGE" -> {
                 try {
@@ -176,7 +177,7 @@ public class StreamingAsrWebSocketHandler extends TextWebSocketHandler {
     }
 
     /**
-     * 连接关闭：清理线程池引用之外的状态。
+     * 连接关闭：清理状态。
      *
      * @param session WebSocket 会话
      * @param status  关闭状态
@@ -184,7 +185,54 @@ public class StreamingAsrWebSocketHandler extends TextWebSocketHandler {
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
         session.getAttributes().remove(ATTR_SEGMENTER);
+        Object executor = session.getAttributes().remove(ATTR_EXECUTOR);
+        if (executor instanceof ExecutorService service) {
+            service.shutdownNow();
+        }
         log.info("流式转写连接关闭 sessionId={} status={}", session.getId(), status);
+    }
+
+    /**
+     * 收尾：flush 最后一段，等所有在途转写完成后再回 STOPPED。
+     *
+     * @param session WebSocket 会话
+     */
+    private void stop(WebSocketSession session) {
+        AtomicBoolean stopping = stoppingFlag(session);
+        if (stopping != null && !stopping.compareAndSet(false, true)) {
+            return;
+        }
+        VadSegmenter segmenter = (VadSegmenter) session.getAttributes().get(ATTR_SEGMENTER);
+        if (segmenter != null) {
+            for (VadSegmenter.Segment segment : segmenter.flush()) {
+                submit(session, segment);
+            }
+        }
+        // 没有任何在途转写时才立刻回 STOPPED
+        if (pending(session).get() == 0) {
+            sendStopped(session);
+            return;
+        }
+        // 兜底超时：即使某个转写卡住，也要让客户端能结束
+        Thread watchdog = new Thread(() -> {
+            long deadline = System.currentTimeMillis() + properties.getStopTimeoutMs();
+            while (System.currentTimeMillis() < deadline) {
+                if (pending(session).get() == 0) {
+                    sendStopped(session);
+                    return;
+                }
+                try {
+                    Thread.sleep(80L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+            log.warn("流式转写收尾超时 sessionId={} pending={}", session.getId(), pending(session).get());
+            sendStopped(session);
+        }, "streaming-asr-stop-" + session.getId());
+        watchdog.setDaemon(true);
+        watchdog.start();
     }
 
     /**
@@ -199,9 +247,21 @@ public class StreamingAsrWebSocketHandler extends TextWebSocketHandler {
         }
         String language = String.valueOf(session.getAttributes().getOrDefault(ATTR_LANGUAGE, "zh"));
         byte[] wav = WavUtils.pcm16ToWav(segment.pcm(), properties.getSampleRate(), 1);
+        AtomicInteger pending = pending(session);
+        pending.incrementAndGet();
+        ExecutorService executor = executor(session);
         try {
-            executor.execute(() -> transcribe(session, segment, wav, language));
-        } catch (RejectedExecutionException e) {
+            executor.execute(() -> {
+                try {
+                    transcribe(session, segment, wav, language);
+                } finally {
+                    if (pending.decrementAndGet() == 0 && isStopping(session)) {
+                        sendStopped(session);
+                    }
+                }
+            });
+        } catch (RuntimeException e) {
+            pending.decrementAndGet();
             sendError(session, "转写繁忙，已跳过一段，请继续说");
         }
     }
@@ -229,6 +289,7 @@ public class StreamingAsrWebSocketHandler extends TextWebSocketHandler {
             payload.put("durationMs", segment.durationMs());
             payload.put("latencyMs", latency);
             payload.put("provider", result.provider());
+            payload.put("final", isStopping(session));
             send(session, payload);
             log.info("流式转写完成 sessionId={} seq={} 时长={}ms 耗时={}ms 字数={}",
                     session.getId(), segment.seq(), segment.durationMs(), latency, text.length());
@@ -237,6 +298,95 @@ public class StreamingAsrWebSocketHandler extends TextWebSocketHandler {
                     session.getId(), segment.seq(), e.getMessage());
             sendError(session, "转写失败：" + e.getMessage());
         }
+    }
+
+    /**
+     * 取会话专用执行器，缺失时补建。
+     *
+     * @param session WebSocket 会话
+     * @return 单线程执行器
+     */
+    private ExecutorService executor(WebSocketSession session) {
+        Object value = session.getAttributes().get(ATTR_EXECUTOR);
+        if (value instanceof ExecutorService service) {
+            return service;
+        }
+        ExecutorService service = newExecutor(session.getId());
+        session.getAttributes().put(ATTR_EXECUTOR, service);
+        return service;
+    }
+
+    /**
+     * 创建一个「单线程 + 有界队列 + 丢弃最旧」的执行器。
+     *
+     * <p>每个连接一个单线程执行器，保证同一场练习的语音段按 seq 顺序转写，
+     * 否则连续两段几乎同时结束时会返回乱序文本（实测出现过
+     * 「高并发交易系统。后端开发经验。」这种倒序）。</p>
+     *
+     * @param sessionId 会话 id，用于线程命名
+     * @return 执行器
+     */
+    private ExecutorService newExecutor(String sessionId) {
+        return new ThreadPoolExecutor(
+                1, 1, 0L, TimeUnit.SECONDS,
+                new ArrayBlockingQueue<>(Math.max(1, properties.getQueueCapacity())),
+                runnable -> {
+                    Thread thread = new Thread(runnable, "streaming-asr-" + sessionId);
+                    thread.setDaemon(true);
+                    return thread;
+                },
+                new ThreadPoolExecutor.DiscardOldestPolicy());
+    }
+
+    /**
+     * 发送 STOPPED，保证只发一次。
+     *
+     * @param session WebSocket 会话
+     */
+    private void sendStopped(WebSocketSession session) {
+        AtomicBoolean sent = (AtomicBoolean) session.getAttributes().get(ATTR_STOPPED_SENT);
+        if (sent == null || !sent.compareAndSet(false, true)) {
+            return;
+        }
+        send(session, Map.of("type", "STOPPED"));
+    }
+
+    /**
+     * 取在途计数，缺失时补一个。
+     *
+     * @param session WebSocket 会话
+     * @return 计数器
+     */
+    private AtomicInteger pending(WebSocketSession session) {
+        Object value = session.getAttributes().get(ATTR_PENDING);
+        if (value instanceof AtomicInteger counter) {
+            return counter;
+        }
+        AtomicInteger counter = new AtomicInteger();
+        session.getAttributes().put(ATTR_PENDING, counter);
+        return counter;
+    }
+
+    /**
+     * 取停止标记。
+     *
+     * @param session WebSocket 会话
+     * @return 标记，缺失时返回 {@code null}
+     */
+    private AtomicBoolean stoppingFlag(WebSocketSession session) {
+        Object value = session.getAttributes().get(ATTR_STOPPING);
+        return value instanceof AtomicBoolean flag ? flag : null;
+    }
+
+    /**
+     * 是否已进入停止状态。
+     *
+     * @param session WebSocket 会话
+     * @return 已停止返回 {@code true}
+     */
+    private boolean isStopping(WebSocketSession session) {
+        AtomicBoolean flag = stoppingFlag(session);
+        return flag != null && flag.get();
     }
 
     /**

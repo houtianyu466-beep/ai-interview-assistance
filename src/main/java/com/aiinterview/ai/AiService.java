@@ -62,13 +62,37 @@ public class AiService {
 
     /**
      * 生成面试题。
+     *
+     * @param positionTitle  应聘岗位或练习方向名称
+     * @param jobDescription 岗位 JD 或练习方向描述
+     * @param resumeSummary  候选人简历摘要，为空表示没有简历
+     * @param count          需要生成的题目数量
+     * @param mode           面试模式
+     * @return AI 生成的题目列表
      */
     public List<GeneratedQuestion> generateQuestions(String positionTitle, String jobDescription,
                                                      String resumeSummary, int count, String mode) {
+        return generateQuestions(positionTitle, jobDescription, resumeSummary, count, mode, List.of());
+    }
+
+    /**
+     * 生成面试题（携带历史已问题目，用于 Prompt 去重）。
+     *
+     * @param positionTitle  应聘岗位或练习方向名称
+     * @param jobDescription 岗位 JD 或练习方向描述
+     * @param resumeSummary  候选人简历摘要，为空表示没有简历
+     * @param count          需要生成的题目数量
+     * @param mode           面试模式
+     * @param avoidQuestions 历史已问题目，可为空
+     * @return AI 生成的题目列表
+     */
+    public List<GeneratedQuestion> generateQuestions(String positionTitle, String jobDescription,
+                                                     String resumeSummary, int count, String mode,
+                                                     List<String> avoidQuestions) {
         List<LlmMessage> messages = List.of(
                 LlmMessage.system(PromptTemplates.questionGenerateSystem()),
                 LlmMessage.user(PromptTemplates.questionGenerateUser(
-                        positionTitle, jobDescription, resumeSummary, count, mode)));
+                        positionTitle, jobDescription, resumeSummary, count, mode, avoidQuestions)));
         String content = chat(AiScenes.QUESTION_GENERATE, messages);
         List<GeneratedQuestion> questions = JsonUtils.fromJson(JsonUtils.stripCodeFence(content),
                 new TypeReference<List<GeneratedQuestion>>() {

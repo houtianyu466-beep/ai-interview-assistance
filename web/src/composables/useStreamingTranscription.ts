@@ -19,6 +19,8 @@ const FRAME_MS = 100
 const SAMPLE_RATE = 16000
 /** 单帧采样点数 */
 const FRAME_SAMPLES = (SAMPLE_RATE * FRAME_MS) / 1000
+/** 等待服务端 STOPPED 的上限：兜底防止连接异常时卡住 */
+const STOP_TIMEOUT_MS = 12_000
 
 const UNSUPPORTED_MESSAGE = '当前浏览器不支持流式转写，请改用文字作答'
 const PERMISSION_DENIED_MESSAGE = '麦克风权限被拒绝，请在地址栏允许后重试'
@@ -275,7 +277,7 @@ export function useStreamingTranscription() {
   async function cleanup(): Promise<void> {
     try {
       if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: 'STOP' }))
+        // STOP 已在 stop() 里发过并等到 STOPPED，这里只负责关闭
         socket.close()
       }
     } catch {
@@ -309,7 +311,43 @@ export function useStreamingTranscription() {
   async function stop(): Promise<void> {
     if (stopped) return
     stopped = true
+    // 等 STOPPED 再断开：服务端会先把最后一句转写推上来，再回 STOPPED，
+    // 否则「说完了却没出字」——这是实测过的缺陷。
+    await waitStopped()
     await cleanup()
+  }
+
+  /** 请求 STOP 并等待服务端 STOPPED（超时兜底 12s） */
+  function waitStopped(): Promise<void> {
+    const socketRef = socket
+    if (!socketRef || socketRef.readyState !== WebSocket.OPEN) {
+      return Promise.resolve()
+    }
+    return new Promise<void>((resolve) => {
+      let settled = false
+      const finish = () => {
+        if (settled) return
+        settled = true
+        window.clearTimeout(timer)
+        socketRef.removeEventListener('message', onMessage)
+        resolve()
+      }
+      const timer = window.setTimeout(finish, STOP_TIMEOUT_MS)
+      const onMessage = (event: MessageEvent) => {
+        try {
+          const data = JSON.parse(String(event.data)) as ServerMessage
+          if (data.type === 'STOPPED') finish()
+        } catch {
+          // 忽略非 JSON
+        }
+      }
+      socketRef.addEventListener('message', onMessage)
+      try {
+        socketRef.send(JSON.stringify({ type: 'STOP' }))
+      } catch {
+        finish()
+      }
+    })
   }
 
   onUnmounted(() => {

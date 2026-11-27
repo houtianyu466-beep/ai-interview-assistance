@@ -83,22 +83,46 @@ app:
       sample-rate: 16000
       # 单帧时长：越小上行越及时，100ms 约 3.2KB/帧
       frame-ms: 100
-      # VAD 静态能量阈值（归一化 RMS），安静环境可下调
-      energy-threshold: 0.012
-      # 自适应阈值系数：阈值 = max(静态阈值, 噪声底 × 系数)
-      noise-factor: 3.0
+      # VAD 绝对能量下限（归一化 RMS）：麦克风偏小声时也不会漏检
+      energy-threshold: 0.006
+      # 自适应阈值系数：起始阈值 = max(绝对下限, 噪声底 × 系数)
+      noise-factor: 2.2
+      # 迟滞比例：已经在说话时用 threshold × 该比例判断「是否还在说」，
+      # 避免句中自然停顿把一句话切碎（0.55 表示弱读到峰值一半仍算在说）
+      end-threshold-ratio: 0.55
+      # 能量滑动平均帧数，抑制单帧毛刺
+      smooth-frames: 3
       # 连续超过阈值多久才算「开始说话」，过滤咳嗽/点击
-      min-speech-ms: 200
+      min-speech-ms: 160
       # 说完后静音多久算一句结束——这是「说完到出字」的主要延迟
       end-silence-ms: 600
       # 单句最长时长，超时强制切段
       max-segment-ms: 15000
       # 切段时向前回补的音频，避免吞掉首字
-      pre-roll-ms: 200
+      pre-roll-ms: 240
       # 转写线程数与排队上限
-      worker-threads: 3
-      queue-capacity: 4
+      worker-threads: 4
+      queue-capacity: 8
+      # STOP 后等待在途转写的最长时间
+      stop-timeout-ms: 20000
 
+  # 语音合成（AI 面试官朗读题目）：none 时前端退回浏览器语音合成
+  tts:
+    provider: ${APP_TTS_PROVIDER:none}
+    # OpenAI 兼容 /audio/speech，如 OpenAI tts-1、硅基流动 CosyVoice2
+    base-url: ${APP_TTS_BASE_URL:https://api.openai.com/v1}
+    api-key: ${APP_TTS_API_KEY:}
+    model: ${APP_TTS_MODEL:tts-1}
+    voice: ${APP_TTS_VOICE:alloy}
+    response-format: mp3
+    speed: 1.0
+    # 火山引擎（豆包）：需要 appid + access token + cluster
+    app-id: ${APP_TTS_APP_ID:}
+    access-token: ${APP_TTS_ACCESS_TOKEN:}
+    cluster: ${APP_TTS_CLUSTER:volcano_tts}
+    volc-voice: ${APP_TTS_VOLC_VOICE:zh_female_shuangkuaisisi_moon_bigtts}
+    max-chars: 1200
+    timeout-seconds: 30
   rag:
     enabled: true
     chunk-size: 600

@@ -54,26 +54,82 @@ public final class PromptTemplates {
                 输出要求：
                 1. 只输出一个 JSON 数组，不要输出任何解释；
                 2. 数组长度严格等于用户要求的题目数量；
-                3. 难度覆盖 2-4 分（1 最简单，5 最难），由浅入深；
-                4. 至少一半题目要结合候选人简历中的技术栈或项目经历，避免纯八股；
-                5. 不要与已有题库重复；
-                6. referenceAnswer 用要点式描述，不超过 200 字；keywords 为 3-6 个关键得分点。
+                3. 难度覆盖 2-4 分（1 最简单，5 最难）；
+                4. 若提供了候选人简历摘要，每一道题都必须引用简历里的具体项目名、技术栈或成果数字，
+                   并以此展开追问，明确禁止出与简历无关的通用八股题；
+                5. 若没有提供候选人简历摘要，则围绕应聘岗位、面试模式与练习方向出题；
+                6. 用户会给出历史已问题目，必须换角度或换项目，禁止重复；
+                7. referenceAnswer 用要点式描述，不超过 200 字；keywords 为 3-6 个关键得分点。
                 JSON 数组元素格式：
                 [{"content":"","category":"JAVA","difficulty":3,"referenceAnswer":"","keywords":[""]}]
                 """;
     }
 
+    /**
+     * 出题 User 提示。
+     *
+     * @param positionTitle  应聘岗位或练习方向名称，可为空
+     * @param jobDescription 岗位 JD 或练习方向描述，可为空
+     * @param resumeSummary  候选人简历摘要，为空表示本次没有简历
+     * @param count          需要生成的题目数量
+     * @param mode           面试模式，可为空
+     * @param avoidQuestions 历史已问题目，最多取前 30 条、每条截断 60 字，可为空
+     * @return User 提示文本
+     */
     public static String questionGenerateUser(String positionTitle, String jobDescription,
-                                             String resumeSummary, int count, String mode) {
+                                             String resumeSummary, int count, String mode,
+                                             List<String> avoidQuestions) {
+        String resumeBlock;
+        if (resumeSummary == null || resumeSummary.isBlank()) {
+            resumeBlock = """
+                    【候选人简历摘要】未提供简历，请优先围绕应聘岗位、面试模式与练习方向出题。
+                    """;
+        } else {
+            resumeBlock = """
+                    【候选人简历摘要】
+                    %s
+                    【简历结合要求】每道题都必须引用简历里的具体项目名、技术栈或成果数字（例如项目名、QPS、P99、年限），
+                    禁止出与简历无关的通用题；题干要能看出是针对这位候选人的追问。
+                    """.formatted(truncate(resumeSummary, 2000));
+        }
         return """
                 请生成 %d 道面试题。
                 【面试模式】%s
                 【应聘岗位】%s
                 【岗位 JD】%s
-                【候选人简历摘要】%s
+                %s
+                %s
                 要求：题目共 %d 道，请直接输出 JSON 数组。
                 """.formatted(count, modeDescription(mode), positionTitle,
-                truncate(jobDescription, 2000), truncate(resumeSummary, 2000), count);
+                truncate(jobDescription, 2000), resumeBlock, historyBlock(avoidQuestions), count);
+    }
+
+    /**
+     * 拼接历史题干提示块：最多 30 条，每条截断 60 字。
+     *
+     * @param avoidQuestions 历史题干列表，可为空
+     * @return 历史题干提示块，没有历史时返回空串
+     */
+    private static String historyBlock(List<String> avoidQuestions) {
+        if (avoidQuestions == null || avoidQuestions.isEmpty()) {
+            return "";
+        }
+        StringJoiner joiner = new StringJoiner("\n");
+        int limit = Math.min(avoidQuestions.size(), 30);
+        for (int i = 0; i < limit; i++) {
+            String question = avoidQuestions.get(i);
+            if (question == null || question.isBlank()) {
+                continue;
+            }
+            joiner.add((i + 1) + ". " + truncate(question.trim(), 60));
+        }
+        if (joiner.length() == 0) {
+            return "";
+        }
+        return """
+                【历史已问题目（以下题目已经问过，必须换角度或换项目，禁止重复）】
+                %s
+                """.formatted(joiner);
     }
 
     public static String answerScoreSystem() {

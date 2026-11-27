@@ -3,6 +3,7 @@ package com.aiinterview.interview.service;
 import com.aiinterview.ai.AiService;
 import com.aiinterview.ai.model.GeneratedQuestion;
 import com.aiinterview.ai.model.ParsedResume;
+import com.aiinterview.ai.model.ProjectExperience;
 import com.aiinterview.common.exception.BizException;
 import com.aiinterview.common.util.JsonUtils;
 import com.aiinterview.common.util.TextUtils;
@@ -18,13 +19,15 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
- * 出题器：AI 优先，题库次之，最后使用内置通用题模板兜底。
+ * 出题器：有简历时 AI 优先并强制结合简历；无简历时题库优先，AI 与内置模板依次补题。
  *
  * <p>生成结果只填充 seq/content/category/difficulty/referenceAnswer，不落库；
  * 这样面试创建失败时可以整体回滚，也不会产生半成品题目。</p>
@@ -38,6 +41,12 @@ public class QuestionGenerator {
     private static final int DEFAULT_TOTAL = 5;
     /** 题数上限 */
     private static final int MAX_TOTAL = 15;
+    /** 传给 Prompt 的历史题干条数上限 */
+    private static final int PROMPT_HISTORY_LIMIT = 30;
+    /** 传给 Prompt 的单条历史题干最大字符数 */
+    private static final int PROMPT_HISTORY_CONTENT_MAX_CHARS = 60;
+    /** 简历相关性校验失败时，允许让 AI 重出的次数 */
+    private static final int RESUME_RETRY_MAX = 1;
 
     /** 内置兜底题模板，至少覆盖 Java / Spring / MySQL / Redis / 算法 / 软素质 */
     private static final List<QuestionTemplate> TEMPLATES = List.of(
@@ -92,16 +101,21 @@ public class QuestionGenerator {
 
     private final AiService aiService;
     private final QuestionService questionService;
+    private final QuestionHistoryService questionHistoryService;
 
     /**
      * 构造器注入。
      *
-     * @param aiService       AI 能力门面
-     * @param questionService 题库服务，用于 AI 不可用时补题
+     * @param aiService              AI 能力门面
+     * @param questionService        题库服务，无简历时优先取题、有简历时用于补题
+     * @param questionHistoryService 历史题干查询服务，用于 Prompt 与二次去重
      */
-    public QuestionGenerator(AiService aiService, QuestionService questionService) {
+    public QuestionGenerator(AiService aiService,
+                             QuestionService questionService,
+                             QuestionHistoryService questionHistoryService) {
         this.aiService = aiService;
         this.questionService = questionService;
+        this.questionHistoryService = questionHistoryService;
     }
 
     /**
@@ -122,9 +136,15 @@ public class QuestionGenerator {
     /**
      * 为一场「面试练习」生成题目：直接用练习方向的标题与描述作为出题上下文。
      *
-     * <p>生成顺序保持原逻辑：AI 优先 → 通用题库补题 → 内置模板补齐并去重。
-     * 练习方向的 id 沿用 {@code interview_session.position_id} 字段，与题库的岗位 id 语义不同，
-     * 因此题库补题只取通用题（position_id 为空）。</p>
+     * <p>出题路径：</p>
+     * <ol>
+     *     <li><b>有简历</b>：AI 优先，并要求每道题引用简历中的项目、技能或成果；题库只补缺口，
+     *         最后用内置模板兜底。AI 题目若与简历毫无词汇重叠，会重出一次，仍失败则保留原题并记录；</li>
+     *     <li><b>无简历</b>：题库优先（按模式尽量匹配分类，取不到再取通用题），题库不足才用 AI 补题，
+     *         AI 仍失败则使用内置模板兜底；</li>
+     *     <li>两条路径都会携带最近练习的历史题干，并在结果上做归一化二次去重；</li>
+     *     <li>最终题目在 seq 连续递增的前提下随机洗牌，避免每次顺序相同。</li>
+     * </ol>
      *
      * @param interview   练习会话（需已确定题数与模式）
      * @param title       练习方向名称，可为空
@@ -137,35 +157,52 @@ public class QuestionGenerator {
         List<InterviewQuestion> result = new ArrayList<>();
         Set<String> usedContents = new LinkedHashSet<>();
 
-        for (GeneratedQuestion generated : generateByAi(interview, title, description, resume, target)) {
-            if (result.size() >= target) {
-                break;
+        // 历史题干先进入去重集合，后续 AI / 题库 / 模板题一旦重复会被直接丢弃
+        List<String> historyContents = loadHistory(interview);
+        for (String historyContent : historyContents) {
+            usedContents.add(normalize(historyContent));
+        }
+        // 无简历时不能把历史题干喂给模型：历史题里含用户简历的项目/数字，
+        // 模型会「换角度复述」它们，导致明明没选简历却出了一堆简历题（实测缺陷）。
+        List<String> promptHistory = resume == null ? List.of() : promptHistory(historyContents);
+
+        // 无简历：题库优先；有简历：AI 优先，题库只在后面补缺口
+        if (resume == null) {
+            String category = bankCategory(interview.getMode());
+            fillFromBank(interview, result, usedContents, target, category);
+            if (category != null && result.size() < target) {
+                fillFromBank(interview, result, usedContents, target, null);
             }
-            addGenerated(result, usedContents, generated);
         }
 
         if (result.size() < target) {
             int need = target - result.size();
-            try {
-                List<QuestionBank> bankQuestions = questionService.pickRandom(null, null, need);
-                if (bankQuestions != null) {
-                    for (QuestionBank bankQuestion : bankQuestions) {
-                        if (result.size() >= target) {
-                            break;
-                        }
-                        addBankQuestion(result, usedContents, bankQuestion);
-                    }
-                }
-            } catch (RuntimeException e) {
-                log.warn("题库补题失败，继续使用内置模板 interviewId={} reason={}", interview.getId(), e.getMessage());
+            List<GeneratedQuestion> candidates = prepareAiCandidates(
+                    generateByAi(interview, title, description, resume, need, promptHistory),
+                    usedContents, need);
+
+            if (resume != null && !candidates.isEmpty()) {
+                candidates = ensureResumeRelevant(interview, title, description, resume,
+                        candidates, usedContents, promptHistory, need);
             }
+            for (GeneratedQuestion generated : candidates) {
+                if (result.size() >= target) {
+                    break;
+                }
+                addGenerated(result, usedContents, generated);
+            }
+        }
+
+        // 有简历时题库只做补齐；无简历时走到这里说明题库不足，同样用题库继续补齐
+        if (result.size() < target) {
+            fillFromBank(interview, result, usedContents, target, null);
         }
 
         for (QuestionTemplate template : TEMPLATES) {
             if (result.size() >= target) {
                 break;
             }
-            if (!usedContents.add(template.content())) {
+            if (!usedContents.add(normalize(template.content()))) {
                 continue;
             }
             result.add(newQuestion(result.size() + 1, template.content(), template.category(),
@@ -176,34 +213,242 @@ public class QuestionGenerator {
         int extra = 0;
         while (result.size() < target) {
             QuestionTemplate template = TEMPLATES.get(extra % TEMPLATES.size());
-            result.add(newQuestion(result.size() + 1, template.content() + "（进阶追问）",
+            String content = template.content() + "（进阶追问）";
+            usedContents.add(normalize(content));
+            result.add(newQuestion(result.size() + 1, content,
                     template.category(), template.difficulty(), template.referenceAnswer()));
             extra++;
+        }
+
+        // 洗牌后重新编号，保证顺序随机但 seq 仍从 1 连续递增
+        Collections.shuffle(result, ThreadLocalRandom.current());
+        for (int i = 0; i < result.size(); i++) {
+            result.get(i).setSeq(i + 1);
         }
         return result;
     }
 
+    /**
+     * 查询最近练习的历史题干，异常时降级为空列表。
+     *
+     * @param interview 当前会话
+     * @return 历史题干列表，失败时为空列表
+     */
+    private List<String> loadHistory(Interview interview) {
+        try {
+            return questionHistoryService.recentQuestionContents(interview.getUserId(), interview.getId());
+        } catch (RuntimeException e) {
+            log.warn("历史题干加载失败，按无历史处理 interviewId={} reason={}",
+                    interview.getId(), e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
+     * 把历史题干裁剪为 Prompt 可用的列表：最多 30 条，每条最多 60 字。
+     *
+     * @param historyContents 历史题干
+     * @return Prompt 用的历史题干列表
+     */
+    private static List<String> promptHistory(List<String> historyContents) {
+        List<String> promptHistory = new ArrayList<>();
+        if (historyContents == null) {
+            return promptHistory;
+        }
+        for (String content : historyContents) {
+            if (promptHistory.size() >= PROMPT_HISTORY_LIMIT) {
+                break;
+            }
+            if (TextUtils.isBlank(content)) {
+                continue;
+            }
+            promptHistory.add(TextUtils.truncate(content.trim(), PROMPT_HISTORY_CONTENT_MAX_CHARS));
+        }
+        return promptHistory;
+    }
+
+    /**
+     * 调用 AI 出题，失败时降级为空列表。
+     *
+     * @param interview     会话
+     * @param title         方向/岗位名称
+     * @param description   方向描述/岗位 JD
+     * @param resume        简历，可为空
+     * @param target        需要生成的题数
+     * @param promptHistory 历史题干（已裁剪）
+     * @return AI 题目列表，失败时为空列表
+     */
     private List<GeneratedQuestion> generateByAi(Interview interview, String title, String description,
-                                                 Resume resume, int target) {
+                                                 Resume resume, int target, List<String> promptHistory) {
         try {
             return aiService.generateQuestions(
                     TextUtils.defaultIfBlank(title, ""),
                     TextUtils.defaultIfBlank(description, ""),
                     resumeSummary(resume),
                     target,
-                    interview.getMode() == null ? InterviewMode.COMPREHENSIVE.name() : interview.getMode().name());
+                    interview.getMode() == null ? InterviewMode.COMPREHENSIVE.name() : interview.getMode().name(),
+                    promptHistory);
         } catch (BizException e) {
             log.warn("AI 出题失败，降级题库/内置模板 interviewId={} reason={}", interview.getId(), e.getMessage());
             return List.of();
         }
     }
 
+    /**
+     * 过滤 AI 题目：去空、去重（含历史题干），并按缺口截断。
+     *
+     * @param generatedQuestions AI 返回的题目
+     * @param usedContents       已占用的归一化题干集合
+     * @param need              当前还缺的题数
+     * @return 可接受的 AI 题目
+     */
+    private List<GeneratedQuestion> prepareAiCandidates(List<GeneratedQuestion> generatedQuestions,
+                                                        Set<String> usedContents, int need) {
+        List<GeneratedQuestion> candidates = new ArrayList<>();
+        if (generatedQuestions == null || need <= 0) {
+            return candidates;
+        }
+        Set<String> seen = new LinkedHashSet<>(usedContents);
+        for (GeneratedQuestion generated : generatedQuestions) {
+            if (candidates.size() >= need) {
+                break;
+            }
+            if (generated == null || TextUtils.isBlank(generated.content())) {
+                continue;
+            }
+            String normalized = normalize(generated.content());
+            if (!seen.add(normalized)) {
+                log.debug("AI 题目与历史题干或本次题目重复，已过滤 content={}", generated.content());
+                continue;
+            }
+            candidates.add(generated);
+        }
+        return candidates;
+    }
+
+    /**
+     * 校验 AI 题目是否结合简历：与简历关键词毫无重叠的题会触发一次重出。
+     *
+     * <p>重出仍无法给出结合简历的替换题时，保留原题并记录 warn，保证题数与流程稳定。</p>
+     *
+     * @param interview     会话
+     * @param title         方向/岗位名称
+     * @param description   方向描述/岗位 JD
+     * @param resume        简历
+     * @param candidates    已通过去重的 AI 题目
+     * @param usedContents  已占用的归一化题干集合
+     * @param promptHistory 历史题干（已裁剪）
+     * @param need          需要的题数
+     * @return 校验后的题目列表，长度不变
+     */
+    private List<GeneratedQuestion> ensureResumeRelevant(Interview interview, String title, String description,
+                                                         Resume resume, List<GeneratedQuestion> candidates,
+                                                         Set<String> usedContents, List<String> promptHistory,
+                                                         int need) {
+        List<String> keywords = resumeKeywords(resume);
+        if (keywords.isEmpty()) {
+            return candidates;
+        }
+        List<Integer> irrelevantIndexes = new ArrayList<>();
+        for (int i = 0; i < candidates.size(); i++) {
+            String content = candidates.get(i).content();
+            if (TextUtils.hits(content, keywords).isEmpty()) {
+                irrelevantIndexes.add(i);
+            }
+        }
+        if (irrelevantIndexes.isEmpty()) {
+            return candidates;
+        }
+        for (Integer index : irrelevantIndexes) {
+            log.warn("AI 题目与简历缺少词汇重叠，尝试重出一次 interviewId={} content={}",
+                    interview.getId(), TextUtils.truncate(candidates.get(index).content(), 120));
+        }
+
+        List<GeneratedQuestion> merged = new ArrayList<>(candidates);
+        Set<String> occupied = new LinkedHashSet<>(usedContents);
+        for (GeneratedQuestion candidate : candidates) {
+            occupied.add(normalize(candidate.content()));
+        }
+        List<GeneratedQuestion> replacements = new ArrayList<>();
+        for (int attempt = 0; attempt < RESUME_RETRY_MAX; attempt++) {
+            List<GeneratedQuestion> retryQuestions = generateByAi(
+                    interview, title, description, resume, need, promptHistory);
+            for (GeneratedQuestion retryQuestion : retryQuestions) {
+                if (retryQuestion == null || TextUtils.isBlank(retryQuestion.content())) {
+                    continue;
+                }
+                if (TextUtils.hits(retryQuestion.content(), keywords).isEmpty()) {
+                    continue;
+                }
+                if (occupied.add(normalize(retryQuestion.content()))) {
+                    replacements.add(retryQuestion);
+                }
+            }
+            if (!replacements.isEmpty()) {
+                break;
+            }
+        }
+
+        int replacementIndex = 0;
+        for (Integer index : irrelevantIndexes) {
+            if (replacementIndex >= replacements.size()) {
+                log.warn("AI 重出后仍无结合简历的替换题，保留原题 interviewId={} content={}",
+                        interview.getId(), TextUtils.truncate(merged.get(index).content(), 120));
+                continue;
+            }
+            merged.set(index, replacements.get(replacementIndex));
+            replacementIndex++;
+        }
+        return merged;
+    }
+
+    /**
+     * 从题库按分类补题，失败只记录 warn。
+     *
+     * @param interview   会话
+     * @param result      当前题目列表
+     * @param usedContents 已占用的归一化题干集合
+     * @param target      目标题数
+     * @param category    题目分类，为空表示通用题
+     */
+    private void fillFromBank(Interview interview, List<InterviewQuestion> result,
+                              Set<String> usedContents, int target, String category) {
+        int need = target - result.size();
+        if (need <= 0) {
+            return;
+        }
+        try {
+            // 练习方向的 id 与题库岗位 id 语义不同，这里只按分类与通用题匹配，不误用 positionId
+            List<QuestionBank> bankQuestions = questionService.pickRandom(null, category, need);
+            if (bankQuestions == null) {
+                return;
+            }
+            for (QuestionBank bankQuestion : bankQuestions) {
+                if (result.size() >= target) {
+                    break;
+                }
+                addBankQuestion(result, usedContents, bankQuestion);
+            }
+        } catch (RuntimeException e) {
+            log.warn("题库补题失败，继续使用 AI/内置模板 interviewId={} category={} reason={}",
+                    interview.getId(), category, e.getMessage());
+        }
+    }
+
+    /**
+     * 把 AI 题目加入结果集，重复题干会被丢弃。
+     *
+     * @param result       结果列表
+     * @param usedContents 已占用的归一化题干集合
+     * @param generated    AI 题目
+     */
     private void addGenerated(List<InterviewQuestion> result, Set<String> usedContents, GeneratedQuestion generated) {
         if (generated == null || TextUtils.isBlank(generated.content())) {
             return;
         }
         String content = generated.content().trim();
-        if (!usedContents.add(content)) {
+        if (!usedContents.add(normalize(content))) {
+            log.debug("AI 题目重复，已丢弃 content={}", content);
             return;
         }
         String referenceAnswer = generated.referenceAnswer();
@@ -214,12 +459,20 @@ public class QuestionGenerator {
                 parseDifficulty(generated.difficulty()), referenceAnswer));
     }
 
+    /**
+     * 把题库题目加入结果集，重复题干会被丢弃。
+     *
+     * @param result       结果列表
+     * @param usedContents 已占用的归一化题干集合
+     * @param bankQuestion 题库题目
+     */
     private void addBankQuestion(List<InterviewQuestion> result, Set<String> usedContents, QuestionBank bankQuestion) {
         if (bankQuestion == null || TextUtils.isBlank(bankQuestion.getContent())) {
             return;
         }
         String content = bankQuestion.getContent().trim();
-        if (!usedContents.add(content)) {
+        if (!usedContents.add(normalize(content))) {
+            log.debug("题库题目与历史题干或本次题目重复，已丢弃 content={}", content);
             return;
         }
         String referenceAnswer = bankQuestion.getReferenceAnswer();
@@ -230,6 +483,16 @@ public class QuestionGenerator {
         result.add(newQuestion(result.size() + 1, content, bankQuestion.getCategory(), difficulty, referenceAnswer));
     }
 
+    /**
+     * 创建一条题目快照，不落库。
+     *
+     * @param seq             题号
+     * @param content         题干
+     * @param category        分类
+     * @param difficulty      难度 1-5
+     * @param referenceAnswer 参考答案
+     * @return 题目实体
+     */
     private InterviewQuestion newQuestion(int seq, String content, String category, int difficulty, String referenceAnswer) {
         InterviewQuestion question = new InterviewQuestion();
         question.setSeq(seq);
@@ -240,6 +503,176 @@ public class QuestionGenerator {
         return question;
     }
 
+    /**
+     * 归一化题干：去掉空白与标点、统一小写，用于「相同或高度相似」判断。
+     *
+     * @param content 题干
+     * @return 归一化后的题干，空值返回空串
+     */
+    private static String normalize(String content) {
+        if (TextUtils.isBlank(content)) {
+            return "";
+        }
+        StringBuilder builder = new StringBuilder(content.length());
+        for (char c : content.toCharArray()) {
+            if (Character.isLetterOrDigit(c)) {
+                builder.append(Character.toLowerCase(c));
+            }
+        }
+        return builder.toString();
+    }
+
+    /**
+     * 按面试模式选择题库分类：HR 面优先行为题，其余不限制分类。
+     *
+     * @param mode 面试模式，可为空
+     * @return 题库分类，{@code null} 表示不限分类
+     */
+    private static String bankCategory(InterviewMode mode) {
+        return mode == InterviewMode.HR ? "BEHAVIOR" : null;
+    }
+
+    /**
+     * 汇总简历关键词，用于判断题目是否结合简历。
+     *
+     * @param resume 简历，可为空
+     * @return 简历技能、项目名等关键词，没有可用关键词时返回空列表
+     */
+    private static List<String> resumeKeywords(Resume resume) {
+        if (resume == null) {
+            return List.of();
+        }
+        Set<String> keywords = new LinkedHashSet<>();
+        ParsedResume parsed = parseResume(resume);
+        if (parsed != null) {
+            addKeywords(keywords, parsed.skills());
+            for (ProjectExperience project : parsed.projects()) {
+                if (project != null) {
+                    addKeywords(keywords, List.of(project.name() == null ? "" : project.name()));
+                }
+            }
+        }
+        addKeywords(keywords, TextUtils.splitCsv(resume.getSkills()));
+        return new ArrayList<>(keywords);
+    }
+
+    /**
+     * 把候选关键词加入集合，过滤空值与过短词，避免「Go」这类短词误命中。
+     *
+     * @param keywords 目标集合
+     * @param values   候选关键词
+     */
+    private static void addKeywords(Set<String> keywords, List<String> values) {
+        if (values == null) {
+            return;
+        }
+        for (String value : values) {
+            if (value == null) {
+                continue;
+            }
+            String trimmed = value.trim();
+            if (trimmed.length() >= 2) {
+                keywords.add(trimmed);
+            }
+        }
+    }
+
+    /**
+     * 解析简历结构化 JSON，失败返回 {@code null}。
+     *
+     * @param resume 简历
+     * @return 结构化简历或 {@code null}
+     */
+    private static ParsedResume parseResume(Resume resume) {
+        if (resume == null || TextUtils.isBlank(resume.getParsedJson())) {
+            return null;
+        }
+        try {
+            return JsonUtils.fromJson(resume.getParsedJson(), ParsedResume.class);
+        } catch (BizException e) {
+            log.debug("简历解析 JSON 反序列化失败 resumeId={}", resume.getId());
+            return null;
+        }
+    }
+
+    /**
+     * 组装简历摘要，供 Prompt 使用。
+     *
+     * <p>摘要包含姓名、工作年限、学历、技能、项目名与成果（项目描述）以及亮点；
+     * 结构化解析缺失时退化为简历原文节选，保证 Prompt 里始终有简历信息。</p>
+     *
+     * @param resume 简历，可为空
+     * @return 简历摘要，没有简历时返回空串
+     */
+    private static String resumeSummary(Resume resume) {
+        if (resume == null) {
+            return "";
+        }
+        ParsedResume parsed = parseResume(resume);
+        StringBuilder builder = new StringBuilder();
+        if (parsed != null) {
+            if (!TextUtils.isBlank(parsed.name())) {
+                builder.append("姓名：").append(parsed.name()).append('\n');
+            }
+            if (parsed.yearsOfExperience() != null) {
+                builder.append("工作年限：").append(parsed.yearsOfExperience()).append(" 年\n");
+            }
+            if (!TextUtils.isBlank(parsed.education())) {
+                builder.append("学历：").append(parsed.education()).append('\n');
+            }
+            if (!parsed.skills().isEmpty()) {
+                builder.append("技能：").append(TextUtils.joinCsv(parsed.skills())).append('\n');
+            }
+            if (!TextUtils.isBlank(parsed.summary())) {
+                builder.append("简介：").append(parsed.summary()).append('\n');
+            }
+            if (!parsed.projects().isEmpty()) {
+                builder.append("项目经历：\n");
+                for (ProjectExperience project : parsed.projects()) {
+                    if (project == null || TextUtils.isBlank(project.name())) {
+                        continue;
+                    }
+                    builder.append("- 项目：").append(project.name());
+                    if (!TextUtils.isBlank(project.role())) {
+                        builder.append("（角色：").append(project.role()).append("）");
+                    }
+                    if (!TextUtils.isBlank(project.description())) {
+                        builder.append("；成果：").append(TextUtils.truncate(project.description().trim(), 200));
+                    }
+                    builder.append('\n');
+                }
+            }
+            if (!parsed.highlights().isEmpty()) {
+                builder.append("亮点：").append(TextUtils.joinCsv(parsed.highlights())).append('\n');
+            }
+        }
+        if (parsed == null && !TextUtils.isBlank(resume.getRawText())) {
+            builder.append("简历原文节选：")
+                    .append(TextUtils.truncate(resume.getRawText().replaceAll("\\s+", " ").trim(), 1200))
+                    .append('\n');
+        }
+        if (parsed == null || parsed.yearsOfExperience() == null) {
+            if (resume.getYearsOfExperience() != null) {
+                builder.append("工作年限：").append(resume.getYearsOfExperience()).append(" 年\n");
+            }
+        }
+        if (parsed == null || TextUtils.isBlank(parsed.education())) {
+            if (!TextUtils.isBlank(resume.getEducation())) {
+                builder.append("学历：").append(resume.getEducation()).append('\n');
+            }
+        }
+        if (!TextUtils.isBlank(resume.getSkills())) {
+            builder.append("技能标签：").append(resume.getSkills()).append('\n');
+        }
+        return TextUtils.truncate(builder.toString().trim(), 2000);
+    }
+
+    /**
+     * 归一化题数：空值或非法值取默认值，并夹到上限。
+     *
+     * @param totalQuestions 会话题数
+     * @return 有效题数
+     */
     private static int normalizeTotal(Integer totalQuestions) {
         if (totalQuestions == null || totalQuestions < 1) {
             return DEFAULT_TOTAL;
@@ -247,6 +680,12 @@ public class QuestionGenerator {
         return Math.min(totalQuestions, MAX_TOTAL);
     }
 
+    /**
+     * 解析 AI 难度：支持数字与中英文关键词。
+     *
+     * @param difficulty AI 返回的难度
+     * @return 难度 1-5
+     */
     private static int parseDifficulty(String difficulty) {
         if (TextUtils.isBlank(difficulty)) {
             return 3;
@@ -269,10 +708,22 @@ public class QuestionGenerator {
         return 3;
     }
 
+    /**
+     * 难度夹取到 1-5。
+     *
+     * @param difficulty 难度
+     * @return 夹取后的难度
+     */
     private static int clampDifficulty(int difficulty) {
         return Math.max(1, Math.min(5, difficulty));
     }
 
+    /**
+     * 组装岗位 JD：岗位描述 + 任职要求。
+     *
+     * @param position 岗位，可为空
+     * @return 岗位 JD 文本，岗位为空时返回空串
+     */
     private static String jobDescription(JobPosition position) {
         if (position == null) {
             return "";
@@ -285,51 +736,6 @@ public class QuestionGenerator {
             builder.append("任职要求：").append(position.getRequirements());
         }
         return TextUtils.truncate(builder.toString().trim(), 4000);
-    }
-
-    private static String resumeSummary(Resume resume) {
-        if (resume == null) {
-            return "";
-        }
-        ParsedResume parsed = null;
-        if (!TextUtils.isBlank(resume.getParsedJson())) {
-            try {
-                parsed = JsonUtils.fromJson(resume.getParsedJson(), ParsedResume.class);
-            } catch (BizException e) {
-                log.debug("简历解析 JSON 反序列化失败 resumeId={}", resume.getId());
-            }
-        }
-        StringBuilder builder = new StringBuilder();
-        if (parsed != null) {
-            if (!TextUtils.isBlank(parsed.summary())) {
-                builder.append("简介：").append(parsed.summary()).append('\n');
-            }
-            if (!parsed.skills().isEmpty()) {
-                builder.append("技能：").append(TextUtils.joinCsv(parsed.skills())).append('\n');
-            }
-            if (parsed.yearsOfExperience() != null) {
-                builder.append("工作年限：").append(parsed.yearsOfExperience()).append(" 年\n");
-            }
-            if (!TextUtils.isBlank(parsed.education())) {
-                builder.append("学历：").append(parsed.education()).append('\n');
-            }
-            if (!parsed.highlights().isEmpty()) {
-                builder.append("亮点：").append(TextUtils.joinCsv(parsed.highlights())).append('\n');
-            }
-            if (!parsed.projects().isEmpty()) {
-                builder.append("项目：").append(TextUtils.joinCsv(parsed.projects().stream()
-                        .map(project -> project.name() == null ? "" : project.name())
-                        .filter(name -> !name.isBlank())
-                        .toList())).append('\n');
-            }
-        }
-        if (!TextUtils.isBlank(resume.getSkills())) {
-            builder.append("技能标签：").append(resume.getSkills()).append('\n');
-        }
-        if (!TextUtils.isBlank(resume.getEducation())) {
-            builder.append("学历：").append(resume.getEducation());
-        }
-        return TextUtils.truncate(builder.toString().trim(), 2000);
     }
 
     /**
