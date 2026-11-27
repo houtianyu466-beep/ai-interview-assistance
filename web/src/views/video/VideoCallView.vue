@@ -263,16 +263,27 @@
               plain
               :icon="Microphone"
               :loading="transcribing"
-              :disabled="!voiceSupported || transcribing || submitting"
+              :disabled="transcribing || submitting || (!voiceSupported && !streamSupported)"
               @click="startRecording"
             >
               {{ transcribing ? '正在转写…' : '语音作答' }}
             </el-button>
             <span class="dock__record-hint">
-              <template v-if="recording">正在录音，请开始作答</template>
+              <template v-if="recording && streamingMode">
+                正在实时转写，说完一句就会出字
+              </template>
+              <template v-else-if="recording">正在录音，请开始作答</template>
+              <template v-else-if="streamError">{{ streamError }}</template>
               <template v-else-if="voiceError">{{ voiceError }}</template>
-              <template v-else>录音会转写成文字，可修改后再提交</template>
+              <template v-else>说完一句立即转写，可修改后再提交</template>
             </span>
+          </div>
+
+          <!-- 流式转写实时字幕：说完一句就显示一句 -->
+          <div v-if="streamingMode && (recording || streamText)" class="dock__live">
+            <span class="dock__live-dot" :class="{ 'is-active': streamSpeechActive }" />
+            <p class="dock__live-text">{{ streamText || '正在聆听…' }}</p>
+            <span v-if="streamLatency > 0" class="dock__live-meta">{{ streamLatency }}ms</span>
           </div>
 
           <el-alert
@@ -391,6 +402,7 @@ import { endVideoRoom, fetchIceConfig, fetchVideoRoom } from '@/api/video'
 import { ApiError } from '@/api/http'
 import { useCallSocket } from '@/composables/useCallSocket'
 import { useVoiceRecorder } from '@/composables/useVoiceRecorder'
+import { useStreamingTranscription } from '@/composables/useStreamingTranscription'
 import {
   createPeer,
   isGetUserMediaSupported,
@@ -488,6 +500,9 @@ const audioPath = ref('')
 const answerResult = ref<AnswerResultVO | null>(null)
 const submitting = ref(false)
 const transcribing = ref(false)
+/** 流式录音的计时器（批式计时由 useVoiceRecorder 提供） */
+const streamElapsed = ref(0)
+let streamTimer: number | null = null
 const asrUnavailable = ref(false)
 const awaitingNext = ref(false)
 
@@ -507,13 +522,31 @@ const {
 
 const {
   supported: voiceSupported,
-  recording,
+  recording: batchRecording,
   elapsedSeconds: voiceElapsed,
   error: voiceError,
   start: startVoiceRecorder,
   stop: stopVoiceRecorder,
   cancel: cancelVoiceRecorder,
 } = useVoiceRecorder()
+
+// 流式转写：说完一句就能出字，不必等整段录音上传
+const {
+  supported: streamSupported,
+  recording: streamRecording,
+  speechActive: streamSpeechActive,
+  text: streamText,
+  lastLatencyMs: streamLatency,
+  error: streamError,
+  start: streamStart,
+  stop: streamStop,
+  reset: streamReset,
+} = useStreamingTranscription()
+
+/** 本次录音是否走流式通道 */
+const streamingMode = ref(false)
+/** 录音中：批式与流式任一进行中都算 */
+const recording = computed(() => batchRecording.value || streamRecording.value)
 
 let peer: WebRTCPeer | null = null
 let initializing = false
@@ -535,7 +568,9 @@ const selfName = computed(() => auth.displayName)
 
 const callClock = computed(() => formatClock(elapsedSeconds.value))
 const questionClock = computed(() => formatClock(questionElapsed.value))
-const voiceClock = computed(() => formatClock(voiceElapsed.value))
+const voiceClock = computed(() =>
+  formatClock(streamingMode.value ? streamElapsed.value : voiceElapsed.value),
+)
 const aiProgress = computed(() =>
   aiSeq.value > 0 && aiTotal.value > 0 ? `第 ${aiSeq.value} / ${aiTotal.value} 题` : '',
 )
@@ -1247,20 +1282,63 @@ function isAsrUnavailable(error: ApiError): boolean {
   )
 }
 
+function stopStreamTimer(): void {
+  if (streamTimer !== null) {
+    window.clearInterval(streamTimer)
+    streamTimer = null
+  }
+}
+
 async function startRecording(): Promise<void> {
   if (recording.value || transcribing.value || submitting.value) return
-  if (!voiceSupported) {
+  if (!voiceSupported && !streamSupported) {
     ElMessage.warning(voiceError.value || '当前浏览器不支持录音，请使用文字作答')
     return
   }
   // 避免把 AI 的朗读声录进答案
   cancelSpeech()
+  if (streamSupported) {
+    streamReset()
+    streamingMode.value = true
+    streamElapsed.value = 0
+    streamTimer = window.setInterval(() => {
+      streamElapsed.value += 1
+    }, 1000)
+    await streamStart()
+    if (streamError.value) {
+      streamingMode.value = false
+      stopStreamTimer()
+      ElMessage.warning(streamError.value)
+      return
+    }
+    return
+  }
   await startVoiceRecorder()
   if (voiceError.value) ElMessage.warning(voiceError.value)
 }
 
 async function stopRecording(): Promise<void> {
   if (!recording.value) return
+  if (streamingMode.value) {
+    transcribing.value = true
+    try {
+      await streamStop()
+      stopStreamTimer()
+      streamingMode.value = false
+      const text = streamText.value.trim()
+      if (!text) {
+        ElMessage.warning('没有识别到有效内容，可以直接输入文字作答')
+        return
+      }
+      const existing = answerText.value.replace(/\s+$/, '')
+      answerText.value = existing ? `${existing}\n${text}` : text
+      asrUnavailable.value = false
+      ElMessage.success('已转写，可修改后提交')
+    } finally {
+      transcribing.value = false
+    }
+    return
+  }
   transcribing.value = true
   try {
     const blob = await stopVoiceRecorder()
@@ -1453,6 +1531,8 @@ function cleanupRuntime(): void {
   resetPeer()
   closeSocket()
   cancelVoiceRecorder()
+  stopStreamTimer()
+  void streamStop()
   stopMediaStream(localStream.value)
   localStream.value = null
   remoteStream.value = null
@@ -2392,6 +2472,48 @@ onUnmounted(() => {
     :deep(.el-alert__title) {
       font-size: 12px;
     }
+  }
+
+  // 流式转写实时字幕
+  &__live {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px 12px;
+    border-radius: 10px;
+    background: rgba(64, 158, 255, 0.12);
+    box-shadow: inset 0 0 0 1px rgba(64, 158, 255, 0.28);
+  }
+
+  &__live-dot {
+    width: 7px;
+    height: 7px;
+    margin-top: 7px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.35);
+    transition: background 0.2s ease;
+
+    &.is-active {
+      background: #f56c6c;
+      box-shadow: 0 0 0 4px rgba(245, 108, 108, 0.22);
+    }
+  }
+
+  &__live-text {
+    flex: 1;
+    min-width: 0;
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.7;
+    color: #e8f0ff;
+    word-break: break-word;
+  }
+
+  &__live-meta {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.45);
   }
 
   &__input {

@@ -15,6 +15,7 @@ flowchart TB
       RTC[WebRTC 音视频]
       WS[WebSocket 信令/字幕]
       COACH[AI 教练抽屉]
+      VADFE[流式录音<br/>AudioWorklet → PCM]
     end
     subgraph 后端
       K[KnowledgeService<br/>BM25 + 可选向量]
@@ -22,6 +23,8 @@ flowchart TB
       V[VideoRoomService]
       S[CallWebSocketHandler]
       P[PracticeService]
+      ASRWS[/ws/asr<br/>VAD 断句]
+      PDF[PDF → DOCX]
     end
     W --> COACH --> A
     A -->|search_knowledge| K
@@ -31,6 +34,9 @@ flowchart TB
     S --> V
     S -->|AI_SAY| P
     P --> K
+    VADFE --> ASRWS
+    ASRWS -->|逐段 WAV| ASR[(语音转写)]
+    W --> PDF
 ```
 
 三块能力都是可运行的实现，不是占位：
@@ -40,6 +46,8 @@ flowchart TB
 | RAG | 真实 BM25 打分 + 真实语料；配置 embedding 后做余弦混合 | 无 embedding 时纯 BM25，仍返回真实命中与分数 |
 | Agent | 真实调用 OpenAI 兼容 `/chat/completions` 的 `tools`，执行工具并回填 `tool` 消息 | 无 Key 时用 RAG 结果生成确定性回答，`fallback=true` |
 | 视频 | WebRTC 真实音视频 + WebSocket 信令；AI 模式 TTS + 字幕 + 语音作答 | 无摄像头可仅文字；无 STUN/TURN 时同局域网可用 |
+| 语音 | 流式：WS + VAD 断句逐段转写；一次性：整段上传 | 流式不可用自动回退一次性，两者都失败则文字作答 |
+| 简历 | docx / pdf / txt / md；PDF 先转 docx 再复用 docx 清洗 | 扫描件无文本层时提示粘贴文本 |
 
 ---
 
@@ -352,8 +360,10 @@ HttpRequest request = HttpRequest.newBuilder(URI.create(baseUrl + "/audio/transc
 
 ### 5.3 前端录音格式
 
-浏览器 `MediaRecorder` 产出 `audio/webm;codecs=opus`，后端按扩展名保存为 `.webm` 再上传；
-部分 ASR 服务对 webm 支持更好，若不支持可让前端改录 `audio/wav`（见 `useVoiceRecorder`）。
+一次性转写走 `MediaRecorder`，产出 `audio/webm;codecs=opus`，后端按扩展名保存为 `.webm` 再上传。
+
+流式转写不走 `MediaRecorder`，改用 `AudioContext` + `AudioWorklet` 直接取 PCM，
+理由见 5.5：实时场景需要的不是「整段文件」，而是「定长小帧」。
 
 ### 5.4 失败语义
 
@@ -361,14 +371,172 @@ HttpRequest request = HttpRequest.newBuilder(URI.create(baseUrl + "/audio/transc
 - 服务 4xx/5xx：包装为 `AI_ERROR`，消息带 HTTP 状态码与响应片段；
 - 转写为空：前端提示「没有录到声音，请重试或直接输入文字」，文字作答始终可用。
 
+### 5.5 流式转写：WS 长连接 + VAD 断句
+
+**为什么改成流式**：一次性方案要等「停止录音 → 上传整段 → 转写」全部完成，
+10 秒音频约 12 秒才出字；流式方案每说完一句（约 600ms 静音）就能拿到这一句，
+实测 8.1 秒中文语音、单段 7.6 秒，转写耗时 **1157ms**。
+
+**数据流**：
+
+```mermaid
+sequenceDiagram
+    participant Mic as 麦克风
+    participant Browser as 浏览器
+    participant WS as /ws/asr
+    participant VAD as VadSegmenter
+    participant ASR as AsrClient
+
+    Mic->>Browser: getUserMedia
+    Browser->>Browser: AudioContext + AudioWorklet → Int16 PCM
+    loop 每 100ms 一帧
+        Browser->>WS: binary PCM frame (3.2KB)
+        WS->>VAD: accept(frame)
+        VAD-->>WS: 无切段
+    end
+    VAD-->>WS: 静音 600ms → Segment
+    WS->>ASR: transcribe(WAV)
+    ASR-->>WS: text
+    WS-->>Browser: TRANSCRIPT {text, seq, latencyMs}
+    Browser->>Browser: 追加到字幕/输入框
+```
+
+**协议**（`ws://host/ws/asr?token=<JWT>&language=zh`）：
+
+| 方向 | 消息 | 说明 |
+|---|---|---|
+| C→S | 二进制帧 | 16kHz / 16bit / 单声道 PCM，默认 100ms 一帧 |
+| C→S | `{"type":"STOP"}` | 结束并 flush 最后一段 |
+| C→S | `{"type":"PING"}` | 心跳 |
+| S→C | `READY` | `{sampleRate, frameMs, endSilenceMs, provider}` |
+| S→C | `SPEECH_START` | VAD 判定开始说话 |
+| S→C | `TRANSCRIPT` | `{text, seq, startMs, endMs, durationMs, latencyMs, provider}` |
+| S→C | `ERROR` | 转写失败但连接保留 |
+| S→C | `STOPPED` | 收尾完成 |
+
+**VAD 策略**（`VadSegmenter`，零第三方依赖）：
+
+- 每帧算归一化 RMS，阈值 = `max(静态阈值, 噪声底 × 系数)`；
+- 噪声底只在非语音帧上做指数平滑，空调/键盘等稳定底噪不会持续误触发；
+- 连续超阈值 `min-speech-ms`（200ms）才进入语音，过滤咳嗽、点击；
+- 静音持续 `end-silence-ms`（600ms）判定一句结束；
+- 超过 `max-segment-ms`（15s）强制切段，避免长句一直不出字；
+- 切段时向前回补 `pre-roll-ms`（200ms），避免吞掉第一个字。
+
+**并发与背压**：连接线程只做 VAD；转写交给固定线程池（默认 3 线程）。
+线程池满时丢弃该段并回 `ERROR`，保证实时性优先于完整性。
+
+**配置**（`application.yml`，均可用环境变量覆盖）：
+
+```yaml
+app:
+  voice:
+    stream:
+      enabled: ${APP_ASR_STREAM_ENABLED:true}
+      sample-rate: 16000
+      frame-ms: 100
+      energy-threshold: 0.012   # 安静环境可下调
+      noise-factor: 3.0
+      min-speech-ms: 200
+      end-silence-ms: 600       # 说完到出字的主要延迟
+      max-segment-ms: 15000
+      pre-roll-ms: 200
+      worker-threads: 3
+      queue-capacity: 4
+```
+
+**调延迟的三个旋钮**：
+
+| 想要 | 调整 | 代价 |
+|---|---|---|
+| 更快出字 | 调小 `end-silence-ms`（如 400） | 说话中途停顿容易被切句 |
+| 更少误切 | 调大 `end-silence-ms`（如 800） | 延迟增加 |
+| 更省 ASR 调用 | 调大 `min-speech-ms`、`pre-roll-ms` | 短句可能被丢弃 |
+
+**前端实现**（`web/src/composables/useStreamingTranscription.ts`）：
+
+- `AudioWorklet` 拿 Float32 采样，主线程按 100ms 聚合 → 降采样到 16kHz → Int16 → 二进制发送；
+- 没有 `AudioWorklet` 的浏览器退回 `ScriptProcessor`；
+- `TRANSCRIPT` 到达即追加到字幕并同步到输入框，中文不插入空格、英文保留空格；
+- 连接失败/权限拒绝/不支持时自动回退到一次性录音方案，功能不中断。
+
+**实测数据**（硅基流动 `SenseVoiceSmall`，本机）：
+
+| 指标 | 数值 |
+|---|---|
+| 上行帧 | 100ms / 3.2KB |
+| 断句判定 | 600ms 静音 |
+| 单段转写耗时 | 1157ms（7.6s 音频） |
+| 整段一次性转写 | 约 12000ms（8.1s 音频） |
+
+### 5.6 回归测试
+
+`VadSegmenterTest` 用合成 PCM 覆盖：全静音不切段、一句话切一段、长句强制切段、
+`flush` 输出尾段、WAV 头与长度。`asr-stream-test.mjs` 用系统语音合成真实中文 WAV
+重采样后按 100ms 推帧，断言 `READY`、`SPEECH_START`、`TRANSCRIPT` 与文本内容。
+
 ---
 
-## 6. 验证与截图
+## 6. 简历解析（含 PDF）
+
+### 6.1 为什么 PDF 先转 docx
+
+简历链路上已经有一套经过验证的 docx 抽取（段落合并、制表符、换行、空行归一化）。
+PDF 只需把文本按行还原成段落，再交给同一套逻辑，避免维护两份文本清洗规则、
+也避免两种格式解析结果不一致。
+
+```
+PDF → PDFBox 抽取文本（按页、按行） → POI 写出 docx（一行一段） → 现有 docx 抽取 → 解析
+```
+
+实现：`PdfToDocxConverter`（PDFBox `PDFTextStripper` + POI `XWPFDocument`）。
+
+### 6.2 支持格式
+
+| 格式 | 处理方式 |
+|---|---|
+| txt / md | UTF-8 直读 |
+| docx | JDK `ZipFile` + DOM 解析 `word/document.xml`（无第三方库） |
+| pdf | PDFBox 抽取 → POI 转 docx → 复用 docx 解析 |
+| 其他 | 拒绝并提示 `txt / md / docx / pdf` |
+
+### 6.3 边界与提示
+
+| 场景 | 行为 |
+|---|---|
+| 扫描件 / 图片型 PDF | 抽不到文本 → 提示「PDF 未提取到文字（可能是扫描件），请改用 docx 或粘贴文本」 |
+| 加密 PDF | 提示「PDF 已加密，无法解析」 |
+| 页数 > 30 | 只解析前 30 页并记录日志 |
+| 文本 > 20000 字 | 截断，避免拖垮 AI 调用与数据库 |
+
+### 6.4 依赖与测试
+
+```xml
+<dependency>
+  <groupId>org.apache.pdfbox</groupId>
+  <artifactId>pdfbox</artifactId>
+  <version>2.0.32</version>
+</dependency>
+<dependency>
+  <groupId>org.apache.poi</groupId>
+  <artifactId>poi-ooxml</artifactId>
+  <version>5.2.5</version>
+</dependency>
+```
+
+`PdfResumeExtractionTest` 覆盖：正常 PDF 抽取关键信息、转出的 docx 是合法 ZIP、
+空白 PDF 给出可操作提示、不支持格式仍被拒绝。
+HTTP 层已实测：上传 `resume-sample.pdf` → `PARSED`，`rawText` 保留了分段。
+
+---
+
+## 7. 验证与截图
 
 ```bash
-mvn test                                # 46 个后端测试
+mvn test                                # 55 个后端测试
 cd web && npm run test:e2e              # 练习 + 教练 UI 冒烟（截图 01-10、17）
 cd web && node scripts/video-test.mjs   # 视频面试 E2E（截图 11-16）
+cd web && node scripts/asr-stream-test.mjs   # 流式转写 E2E（WS + VAD + ASR）
 ```
 
 `video-test.mjs` 使用 Chrome 假摄像头/麦克风：
@@ -389,7 +557,7 @@ cd web && node scripts/video-test.mjs   # 视频面试 E2E（截图 11-16）
 
 ---
 
-## 7. 安全与隐私
+## 8. 安全与隐私
 
 - 知识库、教练、视频房间均要求登录；教练接口校验练习归属；
 - 语音文件落在 `data/uploads/voice/`，仅用于转写，当前无自动清理，生产需加保留策略；
@@ -399,7 +567,7 @@ cd web && node scripts/video-test.mjs   # 视频面试 E2E（截图 11-16）
 
 ---
 
-## 8. 后续演进
+## 9. 后续演进
 
 | 方向 | 内容 |
 |---|---|

@@ -76,6 +76,28 @@ app:
     language: zh
     timeout-seconds: 180
     max-size: 10485760
+    # 流式转写：WS 长连接 + 客户端定长切片 + 服务端 VAD 断句 + 逐句转写
+    stream:
+      enabled: ${APP_ASR_STREAM_ENABLED:true}
+      # 浏览器端降采样到 16kHz 单声道 16bit，必须与服务端一致
+      sample-rate: 16000
+      # 单帧时长：越小上行越及时，100ms 约 3.2KB/帧
+      frame-ms: 100
+      # VAD 静态能量阈值（归一化 RMS），安静环境可下调
+      energy-threshold: 0.012
+      # 自适应阈值系数：阈值 = max(静态阈值, 噪声底 × 系数)
+      noise-factor: 3.0
+      # 连续超过阈值多久才算「开始说话」，过滤咳嗽/点击
+      min-speech-ms: 200
+      # 说完后静音多久算一句结束——这是「说完到出字」的主要延迟
+      end-silence-ms: 600
+      # 单句最长时长，超时强制切段
+      max-segment-ms: 15000
+      # 切段时向前回补的音频，避免吞掉首字
+      pre-roll-ms: 200
+      # 转写线程数与排队上限
+      worker-threads: 3
+      queue-capacity: 4
 
   rag:
     enabled: true

@@ -90,6 +90,7 @@ set APP_ASR_MODEL=whisper-1
 - **草稿**：`localStorage` 按 `practice:draft:{sessionId}:{questionId}` 保存，提交/切题后清理；
 - **AI 教练**：`CoachPanel` 调 `POST /practice/sessions/{id}/coach`，展示工具调用与知识库引用；无模型时提示「知识库检索模式」；
 - **视频**：`useCallSocket`（心跳/重连）+ `useWebRTC`（perfect negotiation、ICE 队列）；AI 模式 TTS 用 `speechSynthesis`；
+- **流式转写**：`useStreamingTranscription`（AudioWorklet → 16kHz PCM → `/ws/asr`），说完一句即出字；失败自动回退 `useVoiceRecorder` + `/voice/transcribe`；
 - **录音资源**：`useVoiceRecorder` 在卸载时释放麦克风轨道与计时器；
 - **构建**：`target: esnext` + `terser`，规避本机 esbuild 临时文件权限问题。
 
@@ -124,6 +125,7 @@ web/src
 | `npm run typecheck` | 仅类型检查 |
 | `npm run test:e2e` | 练习 + AI 教练 UI 冒烟（需本机 Chrome，输出截图） |
 | `node scripts/video-test.mjs` | 视频面试 E2E（假摄像头，覆盖 AI 与真人 WebRTC） |
+| `node scripts/asr-stream-test.mjs` | 流式转写 E2E（合成中文语音 → WS → VAD → ASR） |
 
 ## 8. 环境变量
 

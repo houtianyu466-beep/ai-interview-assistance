@@ -2,7 +2,7 @@
   <div class="resume-list">
     <PageHeader
       title="简历中心"
-      subtitle="上传 docx 或粘贴文本，AI 会自动解析学历、技能、项目与亮点"
+      subtitle="上传 docx / pdf 或粘贴文本，AI 会自动解析学历、技能、项目与亮点"
     >
       <template #actions>
         <el-button :icon="EditPen" @click="openPaste">粘贴文本</el-button>
@@ -15,13 +15,13 @@
         :auto-upload="false"
         :show-file-list="false"
         :disabled="uploading"
-        accept=".txt,.md,.docx"
+        accept=".txt,.md,.docx,.pdf"
         :on-change="onFileChange"
       >
         <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
         <div class="el-upload__text">把简历拖到这里，或 <em>点击选择文件</em></div>
         <template #tip>
-          <div class="el-upload__tip">支持 txt / md / docx，单个文件不超过 10MB；上传后自动开始解析</div>
+          <div class="el-upload__tip">支持 txt / md / docx / pdf，单个文件不超过 10MB；上传后自动开始解析</div>
         </template>
       </el-upload>
       <el-progress v-if="uploading" :percentage="uploadProgress" :stroke-width="8" class="mt-3" />
@@ -86,7 +86,7 @@
     <EmptyState
       v-if="!loading && list.length === 0"
       title="还没有简历"
-      description="上传 docx、粘贴文本，或使用演示账号 candidate 自带的简历"
+      description="上传 docx / pdf、粘贴文本，或使用演示账号 candidate 自带的简历"
       :icon="Document"
     >
       <template #action>
@@ -208,7 +208,7 @@ const matchResult = ref<MatchVO | null>(null)
 const timers = new Map<string, number>()
 const notified = new Set<string>()
 
-const ALLOWED_EXTENSIONS = ['txt', 'md', 'docx']
+const ALLOWED_EXTENSIONS = ['txt', 'md', 'docx', 'pdf']
 const MAX_SIZE = 10 * 1024 * 1024
 const POLL_INTERVAL = 1200
 const MAX_ATTEMPTS = 30
@@ -282,7 +282,7 @@ function startPolling(id: string): void {
 
 function validateFile(file: File): boolean {  const extension = file.name.split('.').pop()?.toLowerCase() ?? ''
   if (!ALLOWED_EXTENSIONS.includes(extension)) {
-    ElMessage.warning('仅支持 txt / md / docx 格式')
+    ElMessage.warning('仅支持 txt / md / docx / pdf 格式')
     return false
   }
   if (file.size > MAX_SIZE) {

@@ -183,7 +183,7 @@
                   </el-button>
                   <span class="voice-panel__status" role="status" aria-live="polite">
                     <span class="voice-panel__pulse" aria-hidden="true" />
-                    正在录音，请开始作答
+                    {{ streamingMode ? '正在实时转写，说完一句就会出字' : '正在录音，请开始作答' }}
                   </span>
                 </template>
                 <template v-else>
@@ -192,7 +192,7 @@
                     plain
                     :icon="Microphone"
                     :loading="transcribing"
-                    :disabled="!voiceSupported || transcribing || submitting"
+                    :disabled="transcribing || submitting || (!voiceSupported && !streamSupported)"
                     class="voice-panel__record"
                     :aria-label="transcribing ? '正在转写语音' : '开始语音作答录音'"
                     @click="startRecording"
@@ -202,16 +202,24 @@
                   <span v-if="transcribing" class="muted" role="status" aria-live="polite">
                     正在把录音转成文字，请稍候…
                   </span>
-                  <span v-else class="muted">录音会转写为文字，可修改后再提交</span>
+                  <span v-else class="muted">说完一句立即转写，可修改后再提交</span>
                 </template>
               </div>
+
+              <!-- 流式转写实时字幕 -->
+              <div v-if="streamingMode && (voiceRecording || streamText)" class="voice-panel__live">
+                <span class="voice-panel__live-dot" :class="{ 'is-active': streamSpeechActive }" />
+                <span class="voice-panel__live-text">{{ streamText || '正在聆听…' }}</span>
+                <span v-if="streamLatency > 0" class="voice-panel__live-meta">{{ streamLatency }}ms</span>
+              </div>
+
               <el-alert
-                v-if="!voiceSupported || voiceError"
+                v-if="(!voiceSupported && !streamSupported) || voiceError || streamError"
                 class="voice-panel__alert"
                 type="warning"
                 :closable="false"
                 show-icon
-                :title="voiceError || '当前浏览器不支持录音，请改用文字作答'"
+                :title="voiceError || streamError || '当前浏览器不支持录音，请改用文字作答'"
               />
             </div>
 
@@ -304,6 +312,7 @@ import EmptyState from '@/components/EmptyState.vue'
 import AnswerFeedback from '@/components/practice/AnswerFeedback.vue'
 import CoachPanel from '@/components/coach/CoachPanel.vue'
 import { useVoiceRecorder } from '@/composables/useVoiceRecorder'
+import { useStreamingTranscription } from '@/composables/useStreamingTranscription'
 import { transcribeAudio } from '@/api/voice'
 import {
   fetchCurrentQuestion,
@@ -354,13 +363,31 @@ let tickerId: number | null = null
 
 const {
   supported: voiceSupported,
-  recording: voiceRecording,
+  recording: batchRecording,
   elapsedSeconds: voiceElapsedSeconds,
   error: voiceError,
   start: startVoiceRecording,
   stop: stopVoiceRecording,
   cancel: cancelVoiceRecording,
 } = useVoiceRecorder()
+
+// 流式转写：说完一句立即出字，不必等整段录音上传
+const {
+  supported: streamSupported,
+  recording: streamRecording,
+  speechActive: streamSpeechActive,
+  text: streamText,
+  lastLatencyMs: streamLatency,
+  error: streamError,
+  start: streamStart,
+  stop: streamStop,
+  reset: streamReset,
+} = useStreamingTranscription()
+
+/** 本次录音是否走流式通道 */
+const streamingMode = ref(false)
+/** 录音中（批式或流式任一） */
+const voiceRecording = computed(() => batchRecording.value || streamRecording.value)
 
 const sessionId = computed(() => {
   const raw = route.params.id
@@ -534,6 +561,7 @@ async function bootstrap(): Promise<void> {
   const id = sessionId.value
   stopTicker()
   cancelVoiceRecording()
+  void streamStop()
   question.value = null
   result.value = null
   hint.value = ''
@@ -640,6 +668,7 @@ async function submitAnswer(): Promise<void> {
       if (session.value) session.value.status = 'FINISHED'
       stopTicker()
       cancelVoiceRecording()
+      void streamStop()
     }
   } catch (error) {
     if (error instanceof ApiError && error.status === 409) {
@@ -734,33 +763,54 @@ async function finishPractice(): Promise<void> {
 async function goReview(): Promise<void> {
   stopTicker()
   cancelVoiceRecording()
+  void streamStop()
   await router.push({ name: 'practice-review', params: { id: sessionId.value } })
 }
 
 function startRecording(): void {
-  if (!voiceSupported || result.value || submitting.value || transcribing.value) return
+  if (result.value || submitting.value || transcribing.value || voiceRecording.value) return
+  if (!voiceSupported && !streamSupported) return
+  if (streamSupported) {
+    streamReset()
+    streamingMode.value = true
+    void streamStart().then(() => {
+      if (streamError.value) {
+        streamingMode.value = false
+        ElMessage.warning(streamError.value)
+      }
+    })
+    return
+  }
   void startVoiceRecording()
 }
 
 async function stopRecording(): Promise<void> {
   if (!voiceRecording.value) return
-  // 先进入 loading，覆盖「停止录音 → 上传 → 转写」全过程，避免重复点击
+  // 先进入 loading，覆盖「停止录音 → 转写」全过程，避免重复点击
   transcribing.value = true
   try {
-    const blob = await stopVoiceRecording()
-    if (!blob.size) {
-      ElMessage.warning('没有录到声音，请重试或改用文字作答')
-      return
-    }
-    const transcription = await transcribeAudio(blob, voiceFilename(blob))
-    const text = (transcription.text ?? '').trim()
+    const text = streamingMode.value
+      ? await (async () => {
+          await streamStop()
+          streamingMode.value = false
+          return streamText.value.trim()
+        })()
+      : await (async () => {
+          const blob = await stopVoiceRecording()
+          if (!blob.size) {
+            ElMessage.warning('没有录到声音，请重试或改用文字作答')
+            return ''
+          }
+          const transcription = await transcribeAudio(blob, voiceFilename(blob))
+          if (transcription.audioPath) audioPath.value = transcription.audioPath
+          return (transcription.text ?? '').trim()
+        })()
     if (!text) {
       ElMessage.warning('没有识别到有效内容，请改用文字作答')
       return
     }
     const existing = answer.value.replace(/\s+$/, '')
     answer.value = existing ? `${existing}\n${text}` : text
-    if (transcription.audioPath) audioPath.value = transcription.audioPath
     ElMessage.success('已转写，可修改后提交')
   } catch (error) {
     ElMessage.error(error instanceof ApiError ? error.message : '语音转写失败，请改用文字作答')
@@ -809,6 +859,7 @@ onUnmounted(() => {
   if (current && !result.value) saveDraft(current.questionId, answer.value)
   stopTicker()
   cancelVoiceRecording()
+  void streamStop()
   teardownNarrowScreenWatcher()
 })
 </script>
@@ -1159,6 +1210,47 @@ onUnmounted(() => {
 
   &__alert {
     margin-top: 10px;
+  }
+
+  // 流式转写实时字幕
+  &__live {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-top: 10px;
+    padding: 8px 10px;
+    border-radius: var(--ai-radius-sm);
+    background: var(--ai-primary-soft);
+  }
+
+  &__live-dot {
+    width: 7px;
+    height: 7px;
+    margin-top: 6px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: var(--ai-border);
+    transition: background 0.2s ease;
+
+    &.is-active {
+      background: var(--ai-danger);
+      box-shadow: 0 0 0 4px rgba(214, 69, 69, 0.18);
+    }
+  }
+
+  &__live-text {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+    line-height: 1.7;
+    color: var(--ai-text);
+    word-break: break-word;
+  }
+
+  &__live-meta {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: var(--ai-text-placeholder);
   }
 }
 

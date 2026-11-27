@@ -37,7 +37,9 @@ import java.util.zip.ZipInputStream;
  *     <li>{@code docx}：使用 JDK 自带的 {@link java.util.zip.ZipFile}/{@link ZipInputStream}
  *         找到 {@code word/document.xml}，再用 DOM 解析，遍历 {@code w:p} 生成段落换行、
  *         拼接 {@code w:t} 文本，不引入任何第三方文档库；</li>
- *     <li>{@code pdf} 及其他格式：直接抛出业务异常并给出明确提示。</li>
+ *     <li>{@code pdf}：先由 {@link PdfToDocxConverter} 把 PDF 转成 docx 字节流，
+ *         之后复用同一套 docx 抽取逻辑，保证两种格式的清洗规则完全一致；</li>
+ *     <li>其他格式：直接抛出业务异常并给出明确提示。</li>
  * </ul>
  *
  * <p>安全要点：DOM 解析已禁用 DOCTYPE 与外部实体，防止 XXE 攻击。
@@ -52,8 +54,18 @@ public class ResumeTextExtractor {
     private static final int MAX_CHARS = 20000;
     /** docx 正文在压缩包内的固定路径 */
     private static final String DOCUMENT_XML = "word/document.xml";
-    private static final String PDF_MESSAGE = "PDF 暂不支持，请上传 docx 或直接粘贴文本";
-    private static final String UNSUPPORTED_MESSAGE = "仅支持 txt / md / docx 格式的简历";
+    private static final String UNSUPPORTED_MESSAGE = "仅支持 txt / md / docx / pdf 格式的简历";
+
+    private final PdfToDocxConverter pdfToDocxConverter;
+
+    /**
+     * 构造器注入 PDF 转换器。
+     *
+     * @param pdfToDocxConverter PDF → docx 转换器
+     */
+    public ResumeTextExtractor(PdfToDocxConverter pdfToDocxConverter) {
+        this.pdfToDocxConverter = pdfToDocxConverter;
+    }
 
     /**
      * 从上传文件中抽取纯文本。
@@ -75,7 +87,8 @@ public class ResumeTextExtractor {
                         yield finish(extractDocx(in));
                     }
                 }
-                case "pdf" -> throw new BizException(ErrorCode.BAD_REQUEST, PDF_MESSAGE);
+                case "pdf" -> finish(extractDocx(
+                        new java.io.ByteArrayInputStream(pdfToDocxConverter.convert(file))));
                 default -> throw new BizException(ErrorCode.BAD_REQUEST, UNSUPPORTED_MESSAGE);
             };
         } catch (IOException e) {
@@ -100,7 +113,8 @@ public class ResumeTextExtractor {
             return switch (extension) {
                 case "txt", "md" -> finish(Files.readString(path, StandardCharsets.UTF_8));
                 case "docx" -> finish(extractDocx(path));
-                case "pdf" -> throw new BizException(ErrorCode.BAD_REQUEST, PDF_MESSAGE);
+                case "pdf" -> finish(extractDocx(
+                        new java.io.ByteArrayInputStream(pdfToDocxConverter.convert(path))));
                 default -> throw new BizException(ErrorCode.BAD_REQUEST, UNSUPPORTED_MESSAGE);
             };
         } catch (IOException e) {

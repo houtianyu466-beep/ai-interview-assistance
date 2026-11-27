@@ -35,14 +35,14 @@
 - 8 个内置练习方向，含重点考察点、默认题数、难度
 - 创建练习：方向 + 面试模式（技术 / HR / 综合）+ 题数（3-15）+ 可选简历
 - 练习房间：逐题作答、提示、跳过、提前结束、实时四维反馈
-- **语音作答**：浏览器录音 → 后端 ASR 转写 → 文本可编辑 → 提交
+- **语音作答**：说完一句即时转写（WebSocket + VAD 断句），文本可编辑后提交；流式不可用时自动回退整段录音
 - 练习复盘：总分、等级、四维能力、优势/待提升、逐题参考答案、下一步练习建议
 - 练习记录：继续未完成的练习、回看已完成复盘
 - **AI 教练**：练习中随时提问，真实调用 DeepSeek function calling，工具包括知识库检索、练习状态、我的简历，回答带引用来源与完整调用链
 - **视频面试**：微信视频通话风格，支持 AI 模拟面试（数字人 + TTS + 字幕 + 语音作答）与真人 1v1（WebRTC + 房间码）
 
 **辅助**
-- 我的简历：上传 docx / 粘贴文本，AI 解析后用于个性化出题
+- 我的简历：上传 docx / pdf / txt / md 或粘贴文本，AI 解析后用于个性化出题（PDF 先转 docx 再复用同一套清洗逻辑）
 - 面试指南：流程、准备清单、自我介绍模板、STAR 法则、常见问题、语音作答建议
 - 个人中心：资料与密码
 - 登录 / 注册 / 令牌续期处理
@@ -161,7 +161,17 @@ set APP_EMBEDDING_MODEL=text-embedding-3-small
 - 教练 Agent 复用上面的 `APP_AI_*`（DeepSeek 用 `deepseek-chat`，支持 tools）；
 - 未配置模型时教练走知识库降级，`fallback=true`，仍然返回真实引用。
 
-### 5.8 一套已实测的供应商组合
+### 5.8 语音链路：一次转写 vs 流式转写
+
+| 模式 | 触发 | 出字时机 | 适用 |
+|---|---|---|---|
+| 流式（默认） | 点「语音作答」→ 边说边传 100ms 一帧 | 说完一句 + 600ms 静音 + 约 1.2s 转写 | 追求「像真人对话」的练习 |
+| 一次性 | 流式不可用时自动回退 | 停止录音后整段上传（10s 音频约 12s） | 浏览器不支持 AudioWorklet |
+
+流式端点：`ws://host/ws/asr?token=<JWT>&language=zh`，消息见 [docs/08 第 5.5 节](docs/08-RAG-Agent-视频通话实现.md)。
+调延迟主要改 `app.voice.stream.end-silence-ms`（默认 600，越小越快、越容易切碎句子）。
+
+### 5.9 一套已实测的供应商组合
 
 本项目当前验证过的混搭（对话用 DeepSeek，检索与语音用硅基流动）：
 
@@ -207,7 +217,7 @@ curl -X POST .../practice/sessions/$SID/coach -H "Authorization: Bearer $TOKEN" 
 
 > 首次启动要把演示资料向量化，`/actuator/health` 已经 UP 时知识库可能还在灌入（`documentCount` 会从 4 涨到 9），稍等再测。
 
-### 5.9 视频面试
+### 5.10 视频面试
 
 - 真人 1v1：创建房间 → 把房间码/链接发给朋友 → 双方进入后自动建立 WebRTC；
 - AI 模拟：选择方向后进入视频房间，AI 用浏览器 TTS 读题，练习者录音作答；
@@ -216,7 +226,7 @@ curl -X POST .../practice/sessions/$SID/coach -H "Authorization: Bearer $TOKEN" 
 ## 6. 测试
 
 ```bash
-mvn test          # 46 个后端测试
+mvn test          # 55 个后端测试
 cd web
 npm run test:e2e  # 练习 + AI 教练 UI 冒烟（需本机 Chrome）
 node scripts/video-test.mjs   # 视频面试 E2E（假摄像头，覆盖 AI 与真人 WebRTC）
@@ -228,10 +238,13 @@ node scripts/video-test.mjs   # 视频面试 E2E（假摄像头，覆盖 AI 与�
 | `ApiIntegrationTest` | 登录、鉴权、旧面试引擎回归 |
 | `Bm25IndexTest` | 中文 2-gram、英文关键词、空查询 |
 | `OpenAiAsrClientTest` | multipart 结构（Content-Length、无 chunked）、401 包装 |
+| `VadSegmenterTest` | VAD 切句、长句强制分段、flush、WAV 头 |
+| `PdfResumeExtractionTest` | PDF 抽取、docx 合法 ZIP、扫描件提示、格式拒绝 |
 | `AgentFallbackTest` | 无 Key 降级、工具调用循环、越权 |
 | `VideoRoomServiceTest` | 房间创建、AI 归属、房间码、结束幂等 |
 | `web/scripts/ui-smoke.mjs` | 登录 → 工作台 → 房间 → 提示 → AI 教练（引用/工具）→ 复盘 → 记录 → 指南 → 移动端 |
 | `web/scripts/video-test.mjs` | AI 视频面试 5 题、真人 1:1 offer/answer/ICE、双方远端视频流 |
+| `web/scripts/asr-stream-test.mjs` | WS 流式转写：READY / SPEECH_START / TRANSCRIPT 与文本 |
 
 UI 截图输出到 `web/screenshots/`。
 
@@ -266,7 +279,7 @@ web/                   # 前端（Vue 3 + TS + Vite）
 
 | 文档 | 内容 |
 |---|---|
-| [RAG · Agent · 视频通话实现](docs/08-RAG-Agent-视频通话实现.md) | BM25/混合检索、工具调用、WebRTC 信令、ASR 兼容性、配置与验证 |
+| [RAG · Agent · 视频通话实现](docs/08-RAG-Agent-视频通话实现.md) | BM25/混合检索、工具调用、WebRTC 信令、流式 ASR（VAD）、PDF 简历、配置与验证 |
 | [练习工具产品重构方案](docs/07-练习工具产品重构方案.md) | 定位、信息架构、练习闭环、语音方案、路线图 |
 | [源码阅读指南](docs/02-源码阅读指南-全流程.md) | 启动、请求链路、面试引擎、AI、WebSocket、断点调试 |
 | [数据库设计](docs/03-数据库设计.md) | 表结构（含 `practice_target` / 知识库 / 视频房间）、状态机 |
