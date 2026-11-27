@@ -1,0 +1,12 @@
+# Docker 构建上下文排除项：只把后端源码送进构建，避免上传 node_modules 与产物
+target/
+.git/
+.idea/
+data/
+logs/
+web/node_modules/
+web/dist/
+deploy/
+docs/
+*.zip
+*.log

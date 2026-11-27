@@ -31,3 +31,7 @@ config/secrets.env
 
 # 本机 Maven 仓库路径配置（不同机器路径不同）
 .mvn/maven.config
+
+# 部署密钥与证书
+deploy/.env
+deploy/certs/
